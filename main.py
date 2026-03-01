@@ -113,6 +113,11 @@ class AppConfig:
     ollama_model: str
     warmup_only: bool
     verbose_model: bool
+    deepgram_enabled: bool = False
+    deepgram_api_key: str = ""
+    llm_provider: str = "ollama"
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
 
 
 @dataclass
@@ -456,6 +461,12 @@ def parse_args() -> AppConfig:
     parser.add_argument("--ollama-model", default="llama3.2:1b", help="Ollama model for topic inference. Default: llama3.2:1b")
     parser.add_argument("--warmup-only", action="store_true", help="Download and load the model, then exit.")
     parser.add_argument("--verbose-model", action="store_true", help="Show faster-whisper progress output.")
+    # Cloud API settings
+    parser.add_argument("--deepgram-enabled", action="store_true", help="Use Deepgram cloud transcription instead of local Whisper.")
+    parser.add_argument("--deepgram-api-key", type=str, default="", help="Deepgram API key.")
+    parser.add_argument("--llm-provider", type=str, default="ollama", choices=["ollama", "gemini"], help="Which LLM to use.")
+    parser.add_argument("--gemini-api-key", type=str, default="", help="Gemini API key.")
+
     args = parser.parse_args()
 
     notes = args.notes.strip()
@@ -604,6 +615,63 @@ def load_local_model(config: AppConfig) -> WhisperModel:
     )
     print("Model ready.", file=sys.stderr)
     return model
+
+
+def ask_gemini(prompt: str, api_key: str, model: str = "gemini-2.5-flash", timeout: int = 30) -> str | None:
+    """Query Google Gemini API via REST. Returns the response text, or None on any failure."""
+    if not api_key:
+        print("Gemini API key is missing.", file=sys.stderr)
+        return None
+        
+    import urllib.parse
+    cleaned_key = urllib.parse.quote(api_key.replace("GEMINI_API_KEY=", "").strip().replace(" ", ""))
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={cleaned_key}"
+    payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
+    
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode())
+            try:
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                return text
+            except (KeyError, IndexError):
+                print(f"Unexpected Gemini response structure: {data}", file=sys.stderr)
+                return None
+    except Exception as e:
+        print(f"Gemini API error: {e}", file=sys.stderr)
+        return None
+
+def ask_gemini_stream(prompt: str, api_key: str, model: str = "gemini-2.5-flash", timeout: int = 60):
+    """Query Google Gemini API via REST and yield response chunks."""
+    if not api_key:
+        yield "Error: Gemini API key is missing. Please configure it in Settings."
+        return
+        
+    import urllib.parse
+    cleaned_key = urllib.parse.quote(api_key.replace("GEMINI_API_KEY=", "").strip().replace(" ", ""))
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={cleaned_key}"
+    payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
+    
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            for line in response:
+                line = line.decode('utf-8').strip()
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_str)
+                        if "candidates" in data and len(data["candidates"]) > 0:
+                            parts = data["candidates"][0].get("content", {}).get("parts", [])
+                            if parts:
+                                yield parts[0].get("text", "")
+                    except json.JSONDecodeError:
+                        continue
+    except Exception as e:
+        yield f"\n[Error connecting to Gemini: {e}]"
 
 
 def build_prompt(context: TranscriptContext, config: AppConfig) -> str | None:
@@ -811,38 +879,8 @@ def format_seconds(value: float) -> str:
 
 
 def write_outputs(session: SessionState, config: AppConfig) -> None:
-    config.output_path.parent.mkdir(parents=True, exist_ok=True)
-    config.metadata_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with session.lock:
-        transcript = session.transcript
-        utterances = [record.to_dict() for record in session.utterances]
-        compression_events = [event.to_dict() for event in session.context.compression_events]
-        compressed_memory = session.context.compressed_memory
-
-    config.output_path.write_text((transcript + "\n") if transcript else "", encoding="utf-8")
-    metadata = {
-        "started_at_utc": session.started_at.astimezone(timezone.utc).isoformat(),
-        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "backend": "faster-whisper",
-        "model": config.model,
-        "backend_device": config.backend_device,
-        "compute_type": config.compute_type,
-        "cpu_threads": config.cpu_threads,
-        "beam_size": config.beam_size,
-        "best_of": config.best_of,
-        "patience": config.patience,
-        "language": config.language,
-        "device": config.device,
-        "sample_rate": config.sample_rate,
-        "block_ms": config.block_ms,
-        "notes_supplied": bool(config.notes),
-        "utterances": utterances,
-        "compression_events": compression_events,
-        "final_compressed_memory": compressed_memory,
-        "output_file": str(config.output_path),
-    }
-    config.metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    # All state is persisted to SQLite `intent.db` via gui.py — no local file writes needed.
+    pass
 
 
 def clean_whisper_artifacts(text: str) -> str:
@@ -995,6 +1033,26 @@ def ask_ollama(prompt: str, model: str = "deepseek-r1:8b") -> str | None:
         return None
 
 
+def ask_ollama_stream(prompt: str, model: str = "deepseek-r1:8b"):
+    """Query local Ollama instance and yield response chunks as they arrive."""
+    payload = json.dumps({"model": model, "prompt": prompt, "stream": True}).encode()
+    req = urllib.request.Request(
+        "http://localhost:11434/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            for line in resp:
+                if line:
+                    data = json.loads(line.decode('utf-8'))
+                    yield data.get("response", "")
+                    if data.get("done"):
+                        break
+    except Exception as exc:
+        yield f"\n[Ollama streaming unavailable: {exc}]"
+
+
 class TopicTracker:
     """Track topic drift with dynamic, multi-topic evolution.
 
@@ -1015,23 +1073,23 @@ class TopicTracker:
     # Short filler phrases to skip during fallback topic extraction
     _FILLER_PATTERNS = re.compile(
         r"^(is it going|are we live|hello|hey|hi|yo|um+|uh+|okay|ok|alright|"
-        r"can you hear|testing|check|one two|let'?s go|let'?s see|yeah|yep|nope|sure|"
-        r"what'?s up|how are you|good morning|good afternoon)[.!?\s]*$",
+        r"test|testing|so um|yeah|so yeah)\b",
         re.IGNORECASE,
     )
 
     def __init__(
         self,
-        drift_threshold: float = 0.32,
-        grace_count: int = 3,
-        ollama_model: str = "llama3.2:1b",
-        on_drift: Any = None,
-        on_similarity: Any = None,
-        on_topic_inferred: Any = None,
+        config: AppConfig,
+        drift_threshold: float = 0.5,
+        grace_count: int = 2,
+        on_drift: Callable[[float], None] | None = None,
+        on_similarity: Callable[[float], None] | None = None,
+        on_topic_inferred: Callable[[str, str], None] | None = None,
+        initial_topic: str | None = None,
     ):
+        self.config = config
         self.drift_threshold = drift_threshold
         self.grace_count = grace_count
-        self.ollama_model = ollama_model
         self.on_drift = on_drift
         self.on_similarity = on_similarity
         self.on_topic_inferred = on_topic_inferred
@@ -1049,6 +1107,10 @@ class TopicTracker:
         self._last_refresh_count = 0
         self._reclassifying = False  # prevent concurrent reclassification
         self._lock = threading.Lock()
+
+        if initial_topic:
+            self._add_topic(initial_topic)
+            self._bootstrapped = True
 
     def _ensure_model(self) -> None:
         if self._model is not None:
@@ -1110,24 +1172,26 @@ class TopicTracker:
             "Only return the topic phrase, nothing else.\n\n"
             f"Conversation:\n{combined}\n\nTopic:"
         )
-        llm_topic = ask_ollama(prompt, model=self.ollama_model)
+        llm_topic = self._ask_llm(prompt)
+        provider_name = "Gemini" if getattr(self.config, "llm_provider", "ollama") == "gemini" else "Ollama"
+
         if llm_topic and 3 < len(llm_topic) < 100:
             topic = llm_topic.strip().rstrip(".")
-            source = "ollama"
-            print(f"Topic inferred (Ollama): {topic}", file=sys.stderr)
+            source = self.config.llm_provider
+            print(f"Topic inferred ({provider_name}): {topic}", file=sys.stderr)
         else:
             raw_fallback = self._extract_fallback_topic(combined)
-            # Try Ollama to condense the fallback sentence into a short phrase
+            # Try LLM to condense the fallback sentence into a short phrase
             condense_prompt = (
                 "Shorten this sentence into a brief topic title (3-8 words). "
                 "Only return the short title, nothing else.\n\n"
                 f"Sentence: {raw_fallback}\n\nShort title:"
             )
-            condensed = ask_ollama(condense_prompt, model=self.ollama_model)
+            condensed = self._ask_llm(condense_prompt)
             if condensed and 3 < len(condensed) < 80:
                 topic = condensed.strip().rstrip(".")
-                source = "ollama"
-                print(f"Topic condensed (Ollama): {topic}", file=sys.stderr)
+                source = self.config.llm_provider
+                print(f"Topic condensed ({provider_name}): {topic}", file=sys.stderr)
             else:
                 topic = raw_fallback
                 source = "heuristic"
@@ -1151,10 +1215,10 @@ class TopicTracker:
                 "Has the conversation moved to a new legitimate topic or agenda item, "
                 "or is it genuinely off-track and unrelated?\n"
                 "Reply with EXACTLY one of:\n"
-                "NEW_TOPIC: <one sentence describing the new topic>\n"
+                "NEW_TOPIC: <one short sentence describing the specific related topic>\n"
                 "OFF_TRACK\n"
             )
-            response = ask_ollama(prompt, model=self.ollama_model)
+            response = self._ask_llm(prompt)
             if response and response.strip().upper().startswith("NEW_TOPIC"):
                 # Extract the new topic text
                 new_topic = response.split(":", 1)[-1].strip().rstrip(".")
@@ -1163,8 +1227,8 @@ class TopicTracker:
                     with self._lock:
                         self._drift_streak = 0
                     if self.on_topic_inferred:
-                        self.on_topic_inferred(new_topic, "ollama")
-                    print(f"Topic evolved (Ollama): {new_topic}", file=sys.stderr)
+                        self.on_topic_inferred(new_topic, self.config.llm_provider)
+                    print(f"Topic evolved ({provider_name}): {new_topic}", file=sys.stderr)
                     return
             # If OFF_TRACK or Ollama failed, fire drift
             with self._lock:
@@ -1183,9 +1247,9 @@ class TopicTracker:
             "Below is a segment of an ongoing conversation. "
             "What is the current main topic being discussed? "
             "Reply with one concise sentence only.\n\n"
-            f"Conversation:\n{recent_window[:600]}\n\nCurrent topic:"
+            f"Conversation:\n{recent_window[-800:]}\n\nCurrent topic:"
         )
-        response = ask_ollama(prompt, model=self.ollama_model)
+        response = self._ask_llm(prompt)
         if response and 5 < len(response) < 200:
             refreshed = response.strip().rstrip(".")
             # Check if it's actually different from the current topic
@@ -1196,8 +1260,8 @@ class TopicTracker:
                 # Substantially different — it's a new topic
                 self._add_topic(refreshed)
                 if self.on_topic_inferred:
-                    self.on_topic_inferred(refreshed, "ollama")
-                print(f"Topic refreshed (new): {refreshed}", file=sys.stderr)
+                    self.on_topic_inferred(refreshed, self.config.llm_provider)
+                print(f"Topic refreshed (new, {self.config.llm_provider}): {refreshed}", file=sys.stderr)
             else:
                 # Just update the latest topic embedding to stay current
                 if self._known_topics:
@@ -1257,6 +1321,16 @@ class TopicTracker:
 
         return similarity
 
+    def _ask_llm(self, prompt: str) -> str | None:
+        provider = getattr(self.config, "llm_provider", "ollama")
+        if provider == "gemini":
+            api_key = getattr(self.config, "gemini_api_key", "").strip()
+            if not api_key:
+                print("Gemini selected but no API key provided; skipping topic inference.", file=sys.stderr)
+                return None
+            return ask_gemini(prompt, api_key=api_key)
+        return ask_ollama(prompt, model=getattr(self.config, "ollama_model", "deepseek-r1:8b"))
+
 
 class TranscriberEngine:
     """Reusable engine wrapping model, audio capture, segmentation, and transcription.
@@ -1300,17 +1374,24 @@ class TranscriberEngine:
     def load_model(self) -> None:
         self.model = load_local_model(self.config)
 
-    def enable_topic_tracking(self, on_topic_inferred: Any = None) -> None:
+    def enable_topic_tracking(self, on_topic_inferred: Any = None, initial_topic: str = "") -> None:
         """Enable auto-inferred topic tracking."""
         try:
             self.topic_tracker = TopicTracker(
-                ollama_model=self.config.ollama_model,
+                config=self.config,
+                drift_threshold=0.5,
+                grace_count=2,
                 on_drift=self.on_drift,
                 on_similarity=self.on_similarity,
                 on_topic_inferred=on_topic_inferred,
+                initial_topic=initial_topic,
             )
-            self.topic_tracker._ensure_model()
-            print("Topic tracking enabled (will infer from conversation).", file=sys.stderr)
+            
+            # Check if Ollama needs to be warmed up in advance
+            if getattr(self.config, 'llm_provider', 'ollama') != "gemini":
+                self.topic_tracker._ensure_model()
+                
+            print(f"Topic tracking enabled (will infer from conversation using {getattr(self.config, 'llm_provider', 'ollama')}).", file=sys.stderr)
         except ImportError:
             print(
                 "Warning: sentence-transformers not installed, topic tracking disabled.\n"
@@ -1356,39 +1437,101 @@ class TranscriberEngine:
             finally:
                 self._utterance_queue.task_done()
 
+
+    def _transcribe_utterance_deepgram(self, utterance: Utterance) -> tuple[list[Any], str]:
+        """POST utterance to Deepgram REST API and return mock segments & speaker."""
+        import wave
+        import io
+        import json
+        import urllib.request
+        from dataclasses import dataclass
+        
+        @dataclass
+        class MockSegment:
+            text: str
+
+        wav_io = io.BytesIO()
+        with wave.open(wav_io, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.config.sample_rate)
+            wf.writeframes((utterance.audio * 32767).astype(np.int16).tobytes())
+            
+        data = wav_io.getvalue()
+        
+        url = "https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&diarize=true"
+        req = urllib.request.Request(url, data=data, headers={
+            "Authorization": f"Token {self.config.deepgram_api_key}",
+            "Content-Type": "audio/wav"
+        })
+        
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                
+            channels = result.get('results', {}).get('channels', [])
+            if not channels:
+                return [], ""
+                
+            alt = channels[0].get('alternatives', [{}])[0]
+            transcript = alt.get('transcript', '')
+            words = alt.get('words', [])
+            
+            if not transcript:
+                return [], ""
+                
+            speaker_counts = Counter(w.get('speaker') for w in words if 'speaker' in w)
+            main_speaker = ""
+            if speaker_counts:
+                most_common = speaker_counts.most_common(1)[0][0]
+                if most_common is not None:
+                    main_speaker = f"SPEAKER_{most_common:02d}"
+                    
+            return [MockSegment(text=transcript)], main_speaker
+        except Exception as e:
+            print(f"Deepgram transcription failed: {e}. Falling back to Whisper...", file=sys.stderr)
+            return [], ""
+
     def _transcribe_utterance(self, utterance: Utterance) -> None:
         assert self.model is not None
         with self.session.lock:
             prompt = build_prompt(self.session.context, self.config)
             transcript_tail = self.session.transcript[-8_000:]
 
-        segments, _info = self.model.transcribe(
-            preprocess_audio(utterance.audio),
-            language=self.config.language,
-            task="transcribe",
-            log_progress=self.config.verbose_model,
-            beam_size=self.config.beam_size,
-            best_of=self.config.best_of,
-            patience=self.config.patience,
-            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
-            compression_ratio_threshold=2.4,
-            log_prob_threshold=-1.0,
-            no_speech_threshold=0.45,
-            condition_on_previous_text=False,
-            initial_prompt=prompt,
-            hotwords=hotwords_from_notes(self.config.notes),
-            without_timestamps=True,
-            word_timestamps=False,
-            vad_filter=True,
-            vad_parameters=dict(
-                threshold=0.35,
-                min_silence_duration_ms=250,
-                min_speech_duration_ms=100,
-                speech_pad_ms=200,
-            ),
-            repetition_penalty=1.2,
-            no_repeat_ngram_size=0,
-        )
+        segments = []
+        deepgram_speaker = ""
+        
+        if self.config.deepgram_enabled and self.config.deepgram_api_key:
+            segments, deepgram_speaker = self._transcribe_utterance_deepgram(utterance)
+            
+        if not segments:
+            segments, _info = self.model.transcribe(
+                preprocess_audio(utterance.audio),
+                language=self.config.language,
+                task="transcribe",
+                log_progress=self.config.verbose_model,
+                beam_size=self.config.beam_size,
+                best_of=self.config.best_of,
+                patience=self.config.patience,
+                temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+                compression_ratio_threshold=2.4,
+                log_prob_threshold=-1.0,
+                no_speech_threshold=0.6,
+                condition_on_previous_text=False,
+                initial_prompt=prompt,
+                hotwords=hotwords_from_notes(self.config.notes),
+                without_timestamps=True,
+                word_timestamps=False,
+                vad_filter=True,
+                vad_parameters=dict(
+                    threshold=0.3,
+                    min_silence_duration_ms=250,
+                    min_speech_duration_ms=100,
+                    speech_pad_ms=300,
+                ),
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=0,
+            )
 
         raw_text = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
         text = clean_whisper_artifacts(trim_overlapping_prefix(transcript_tail, raw_text))
@@ -1399,8 +1542,9 @@ class TranscriberEngine:
             print(f"[{format_seconds(utterance.start_seconds)}] (filtered: {text[:80]})", file=sys.stderr)
             return
 
-        speaker = ""
-        if self.speaker_tracker is not None:
+        if deepgram_speaker:
+            speaker = deepgram_speaker
+        elif self.speaker_tracker is not None:
             speaker = self.speaker_tracker.identify(utterance.audio, self.config.sample_rate)
             self.speaker_tracker.save_profiles()
 

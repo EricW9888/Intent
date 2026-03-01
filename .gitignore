@@ -11,3 +11,4 @@ models/
 .idea/
 .vscode/
 env/
+settings.json

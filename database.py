@@ -76,6 +76,17 @@ def init_db(db_path: Path = DB_PATH) -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_compression_session ON compression_events(session_id);
+
+        CREATE TABLE IF NOT EXISTS concept_maps (
+            id TEXT PRIMARY KEY,
+            session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+            folder_id TEXT REFERENCES folders(id) ON DELETE CASCADE,
+            graph_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_concept_maps_session ON concept_maps(session_id);
+        CREATE INDEX IF NOT EXISTS idx_concept_maps_folder ON concept_maps(folder_id);
     """)
     conn.commit()
 
@@ -110,6 +121,7 @@ def rename_folder(folder_id: str, new_name: str, db_path: Path = DB_PATH) -> Non
 
 def delete_folder(folder_id: str, db_path: Path = DB_PATH) -> bool:
     conn = _connect(db_path)
+    conn.execute("UPDATE sessions SET folder_id = NULL WHERE folder_id = ?", (folder_id,))
     cursor = conn.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
     conn.commit()
     conn.close()
@@ -167,6 +179,20 @@ def save_utterance(
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (session_id, index, round(start_seconds, 3), round(end_seconds, 3), text, raw_text, speaker, int(forced_split)),
     )
+    conn.commit()
+    conn.close()
+
+
+def mark_utterance_split(session_id: str, index: int, db_path: Path = DB_PATH) -> None:
+    conn = _connect(db_path)
+    conn.execute("UPDATE utterances SET forced_split = 1 WHERE session_id = ? AND idx = ?", (session_id, index))
+    conn.commit()
+    conn.close()
+
+
+def assign_session_to_folder(session_id: str, folder_id: str | None, db_path: Path = DB_PATH) -> None:
+    conn = _connect(db_path)
+    conn.execute("UPDATE sessions SET folder_id = ? WHERE id = ?", (folder_id, session_id))
     conn.commit()
     conn.close()
 
@@ -293,6 +319,8 @@ def get_session(session_id: str, db_path: Path = DB_PATH) -> dict[str, Any] | No
 
 def delete_session(session_id: str, db_path: Path = DB_PATH) -> bool:
     conn = _connect(db_path)
+    conn.execute("DELETE FROM utterances WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM compression_events WHERE session_id = ?", (session_id,))
     cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
     conn.commit()
     conn.close()
@@ -304,3 +332,79 @@ def update_session_title(session_id: str, title: str, db_path: Path = DB_PATH) -
     conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, session_id))
     conn.commit()
     conn.close()
+
+
+def save_concept_map(
+    graph_json: str,
+    session_id: str | None = None,
+    folder_id: str | None = None,
+    db_path: Path = DB_PATH,
+) -> str:
+    """Save or replace a concept map for a session or folder."""
+    conn = _connect(db_path)
+    # Delete existing map for this session/folder
+    if session_id:
+        conn.execute("DELETE FROM concept_maps WHERE session_id = ?", (session_id,))
+    elif folder_id:
+        conn.execute("DELETE FROM concept_maps WHERE folder_id = ? AND session_id IS NULL", (folder_id,))
+    map_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO concept_maps (id, session_id, folder_id, graph_json, created_at) VALUES (?, ?, ?, ?, ?)",
+        (map_id, session_id, folder_id, graph_json, now),
+    )
+    conn.commit()
+    conn.close()
+    return map_id
+
+
+def get_concept_map(session_id: str | None = None, folder_id: str | None = None, db_path: Path = DB_PATH) -> dict[str, Any] | None:
+    """Get a concept map by session or folder."""
+    conn = _connect(db_path)
+    if session_id:
+        row = conn.execute("SELECT * FROM concept_maps WHERE session_id = ? ORDER BY created_at DESC LIMIT 1", (session_id,)).fetchone()
+    elif folder_id:
+        row = conn.execute("SELECT * FROM concept_maps WHERE folder_id = ? AND session_id IS NULL ORDER BY created_at DESC LIMIT 1", (folder_id,)).fetchone()
+    else:
+        conn.close()
+        return None
+    conn.close()
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "folder_id": row["folder_id"],
+        "graph": json.loads(row["graph_json"]),
+        "created_at": row["created_at"],
+    }
+
+
+def get_folder_session_transcripts(folder_id: str | None, db_path: Path = DB_PATH) -> list[dict[str, Any]]:
+    """Get all session transcripts in a folder for building folder-level maps."""
+    conn = _connect(db_path)
+    if folder_id is None:
+        rows = conn.execute(
+            "SELECT id, title, transcript FROM sessions WHERE folder_id IS NULL ORDER BY started_at"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, title, transcript FROM sessions WHERE folder_id = ? ORDER BY started_at",
+            (folder_id,),
+        ).fetchall()
+    results = []
+    for r in rows:
+        transcript = r["transcript"] or ""
+        if not transcript.strip():
+            # Build from utterances as fallback
+            utts = conn.execute(
+                "SELECT speaker, text FROM utterances WHERE session_id = ? ORDER BY idx",
+                (r["id"],),
+            ).fetchall()
+            transcript = "\n".join(
+                f"[{u['speaker']}] {u['text']}" for u in utts if u["text"].strip()
+            )
+        if transcript.strip():
+            results.append({"id": r["id"], "title": r["title"], "transcript": transcript})
+    conn.close()
+    return results

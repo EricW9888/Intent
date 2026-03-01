@@ -2,20 +2,24 @@ import sys
 import threading
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeView, QTextEdit, QPushButton, QLabel, QSplitter, QMenu,
-    QInputDialog, QMessageBox, QFrame, QHeaderView, QStyleFactory, QDialog, QCheckBox, QDialogButtonBox
+    QInputDialog, QMessageBox, QFrame, QHeaderView, QStyleFactory, QDialog,
+    QCheckBox, QDialogButtonBox, QLineEdit, QTabWidget,
 )
 from PyQt6.QtGui import (
-    QStandardItemModel, QStandardItem, QColor, QFont,
-    QTextCursor, QTextCharFormat, QBrush, QPalette
+    QAction, QIcon, QFont, QColor, QPalette, QTextCursor, QTextDocument,
+    QStandardItemModel, QStandardItem, QTextCharFormat, QBrush
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QModelIndex, QMimeData
 
 import database as db
 from main import TranscriberEngine, AppConfig, default_output_paths, UtteranceRecord, ensure_ollama
+from concept_map_widget import ConceptMapWidget
+from concept_extraction import extract_concepts, merge_concept_maps
 
 SPEAKER_COLORS_DARK = [
     "#60a5fa", "#34d399", "#a78bfa", "#fbbf24",
@@ -54,14 +58,14 @@ def _build_stylesheet(dark: bool) -> str:
                 padding: 10px;
             }
             QPushButton {
-                background-color: #6366f1;
+                background-color: #1a36b4;
                 color: white;
                 border: none;
                 border-radius: 6px;
                 padding: 8px 16px;
                 font-weight: bold;
             }
-            QPushButton:hover { background-color: #4f46e5; }
+            QPushButton:hover { background-color: #11247a; }
             QPushButton:disabled { background-color: #334155; color: #64748b; }
             QLabel { color: #e2e8f0; }
             QSplitter::handle { background-color: #334155; width: 1px; }
@@ -89,14 +93,14 @@ def _build_stylesheet(dark: bool) -> str:
             padding: 10px;
         }
         QPushButton {
-            background-color: #6366f1;
+            background-color: #1a36b4;
             color: white;
             border: none;
             border-radius: 6px;
             padding: 8px 16px;
             font-weight: bold;
         }
-        QPushButton:hover { background-color: #4f46e5; }
+        QPushButton:hover { background-color: #11247a; }
         QPushButton:disabled { background-color: #e2e8f0; color: #94a3b8; }
         QLabel { color: #1e293b; }
         QSplitter::handle { background-color: #e2e8f0; width: 1px; }
@@ -148,17 +152,92 @@ class SessionTreeModel(QStandardItemModel):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None, enable_ollama=True):
+    def __init__(self, parent=None, enable_ollama=True, deepgram_enabled=False, deepgram_api_key="", llm_provider="ollama", gemini_api_key=""):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setFixedSize(350, 150)
+        self.setFixedSize(420, 340)
         
         layout = QVBoxLayout(self)
         
-        self.ollama_checkbox = QCheckBox("Enable Smart Topic Detection (Ollama)")
+        # --- AI Topic Detection Section ---
+        ollama_header = QLabel("AI Topic Detection")
+        ollama_header.setStyleSheet("font-weight: bold; font-size: 13px;")
+        layout.addWidget(ollama_header)
+        
+        self.ollama_checkbox = QCheckBox("Enable AI Topic Detection")
         self.ollama_checkbox.setChecked(enable_ollama)
-        self.ollama_checkbox.setToolTip("Uses local AI for highly accurate topic tracking.")
+        self.ollama_checkbox.setToolTip("Use AI to infer topics and detect drift.")
         layout.addWidget(self.ollama_checkbox)
+        
+        # --- LLM Provider Section ---
+        llm_header = QLabel("AI Provider")
+        llm_header.setStyleSheet("font-weight: bold; font-size: 13px; margin-top: 10px;")
+        layout.addWidget(llm_header)
+        
+        from PyQt6.QtWidgets import QRadioButton, QButtonGroup
+        self.provider_group = QButtonGroup(self)
+        
+        provider_layout = QHBoxLayout()
+        self.radio_ollama = QRadioButton("Local AI (Ollama)")
+        self.radio_gemini = QRadioButton("Gemini AI (Cloud)")
+        
+        self.provider_group.addButton(self.radio_ollama)
+        self.provider_group.addButton(self.radio_gemini)
+        
+        provider_layout.addWidget(self.radio_ollama)
+        provider_layout.addWidget(self.radio_gemini)
+        layout.addLayout(provider_layout)
+        
+        gemini_key_layout = QHBoxLayout()
+        gemini_key_label = QLabel("Gemini API Key:")
+        gemini_key_layout.addWidget(gemini_key_label)
+        self.gemini_key_input = QLineEdit()
+        self.gemini_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.gemini_key_input.setPlaceholderText("Paste your Gemini API key...")
+        self.gemini_key_input.setText(gemini_api_key)
+        gemini_key_layout.addWidget(self.gemini_key_input)
+        layout.addLayout(gemini_key_layout)
+        
+        # Set initial values
+        if llm_provider == "gemini":
+            self.radio_gemini.setChecked(True)
+            self.gemini_key_input.setEnabled(True)
+        else:
+            self.radio_ollama.setChecked(True)
+            self.gemini_key_input.setEnabled(False)
+            
+        self.radio_gemini.toggled.connect(self.gemini_key_input.setEnabled)
+        
+        # --- Separator ---
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(line)
+        
+        # --- Deepgram Section ---
+        dg_header = QLabel("Cloud Transcription")
+        dg_header.setStyleSheet("font-weight: bold; font-size: 13px;")
+        layout.addWidget(dg_header)
+        
+        self.deepgram_checkbox = QCheckBox("Use Deepgram Cloud Transcription")
+        self.deepgram_checkbox.setChecked(deepgram_enabled)
+        self.deepgram_checkbox.setToolTip("Uses Deepgram's Nova-3 model for superior accuracy with accents, overlap, and diarization.")
+        layout.addWidget(self.deepgram_checkbox)
+        
+        key_layout = QHBoxLayout()
+        key_label = QLabel("API Key:")
+        key_layout.addWidget(key_label)
+        self.deepgram_key_input = QLineEdit()
+        self.deepgram_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.deepgram_key_input.setPlaceholderText("Paste your Deepgram API key...")
+        self.deepgram_key_input.setText(deepgram_api_key)
+        self.deepgram_key_input.setEnabled(deepgram_enabled)
+        key_layout.addWidget(self.deepgram_key_input)
+        layout.addLayout(key_layout)
+        
+        # Toggle API key field visibility based on checkbox
+        self.deepgram_checkbox.toggled.connect(self.deepgram_key_input.setEnabled)
+        
         layout.addStretch()
         
         self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -189,6 +268,7 @@ class MainWindow(QMainWindow):
 
         self.engine_lock = threading.Lock()
         self.current_session_id: str | None = None
+        self.engine = None  # set before UI/load_tree to avoid early attribute access
         self.signals = EngineSignals()
         self.signals.utterance_received.connect(self._on_utterance_gui)
         self.signals.status_changed.connect(self._on_status_gui)
@@ -196,6 +276,11 @@ class MainWindow(QMainWindow):
         self.signals.similarity_updated.connect(self._on_similarity_gui)
         self.signals.topic_inferred.connect(self._on_topic_inferred_gui)
         self.signals.ollama_status.connect(self._on_ollama_status_gui)
+
+        # Signal for concept map results (thread-safe)
+        self._map_ready_signal = pyqtSignal  # placeholder
+        self.signals.status_changed.connect(self._check_map_result)  # reuse status for simplicity
+        self._pending_map_graph = None
 
         self.speaker_colors: dict[str, str] = {}
         self.speaker_idx = 0
@@ -230,7 +315,7 @@ class MainWindow(QMainWindow):
             with open("settings.json", "r") as f:
                 return json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
-            return {"enable_ollama": True}
+            return {"enable_ollama": True, "last_folder_id": None}
 
     def _save_settings(self):
         with open("settings.json", "w") as f:
@@ -238,7 +323,16 @@ class MainWindow(QMainWindow):
 
     def _preload_model(self):
         try:
-            if self.settings.get("enable_ollama", True):
+            provider = self.settings.get("llm_provider", "ollama")
+            use_ollama = self.settings.get("enable_ollama", True) and provider == "ollama"
+
+            if provider == "gemini":
+                gem_key = self.settings.get("gemini_api_key", "").strip()
+                if not gem_key:
+                    self.signals.ollama_status.emit({"status": "no_key", "model": None})
+                else:
+                    self.signals.ollama_status.emit({"status": "gemini", "model": "gemini"})
+            elif use_ollama:
                 # Check/start Ollama in the background and auto-detect model
                 ollama_result = ensure_ollama(preferred_model=self.engine.config.ollama_model)
                 # Update engine config with the detected model
@@ -254,7 +348,7 @@ class MainWindow(QMainWindow):
             self.engine.load_model()
             
             # Warm up Ollama model so first topic inference is fast
-            if self.settings.get("enable_ollama", True) and getattr(self, "engine", None) and getattr(self.engine, "config", None) and self.engine.config.ollama_model:
+            if use_ollama and getattr(self, "engine", None) and getattr(self.engine, "config", None) and self.engine.config.ollama_model:
                 from main import ask_ollama
                 print("Warming up Ollama model...", file=sys.stderr)
                 ask_ollama("Say OK", model=ollama_result["model"])
@@ -287,23 +381,36 @@ class MainWindow(QMainWindow):
         self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self._on_tree_context_menu)
         self.tree_view.doubleClicked.connect(self._on_tree_double_click)
+        self.tree_view.clicked.connect(self._on_tree_clicked)
         self.tree_view.setDragEnabled(True)
         self.tree_view.setAcceptDrops(True)
         self.tree_view.setDropIndicatorShown(True)
         self.tree_view.setDragDropMode(QTreeView.DragDropMode.DragDrop)
         self.tree_view.setDefaultDropAction(Qt.DropAction.MoveAction)
+        
+        # Enable complete row selection and keep highlight active
+        self.tree_view.setSelectionMode(QTreeView.SelectionMode.SingleSelection)
+        self.tree_view.setSelectionBehavior(QTreeView.SelectionBehavior.SelectRows)
+        self.tree_view.setFocusPolicy(Qt.FocusPolicy.NoFocus) # Remove dotted outline
 
         self.tree_model = SessionTreeModel()
         self.tree_model.session_moved.connect(self._on_session_moved)
         self.tree_view.setModel(self.tree_model)
         sidebar_layout.addWidget(self.tree_view)
 
-        new_folder_btn = QPushButton("New Folder")
+        new_folder_btn = QPushButton("+ New Folder")
         new_folder_btn.clicked.connect(self._action_new_folder)
         sidebar_layout.addWidget(new_folder_btn)
         
-        settings_btn = QPushButton("⚙️ Settings")
+        settings_btn = QPushButton("Settings")
         settings_btn.clicked.connect(self._open_settings)
+        btn_bg = "#334155" if self.dark else "#e2e8f0"
+        btn_fg = "#e2e8f0" if self.dark else "#475569"
+        btn_hover = "#475569" if self.dark else "#cbd5e1"
+        settings_btn.setStyleSheet(f"""
+            QPushButton {{ background-color: {btn_bg}; color: {btn_fg}; border: none; border-radius: 6px; padding: 8px 16px; font-weight: bold; }}
+            QPushButton:hover {{ background-color: {btn_hover}; }}
+        """)
         sidebar_layout.addWidget(settings_btn)
 
         # 2. Main View (Transcript)
@@ -313,8 +420,29 @@ class MainWindow(QMainWindow):
 
         # Top Bar
         top_bar = QHBoxLayout()
-        self.title_label = QLabel("New Session")
-        self.title_label.setFont(QFont("Helvetica Neue", 18, QFont.Weight.Bold))
+        self.title_input = QLineEdit("New Session")
+        self.title_input.setPlaceholderText("Set Manual Topic...")
+        self.title_input.setFont(QFont("Helvetica Neue", 18, QFont.Weight.Bold))
+        # Style QLineEdit to look like a label but editable
+        bg_color = "transparent"
+        text_color = self._text_color.name()
+        hover_bg = "#f1f5f9" if not self.dark else "#334155"
+        self.title_input.setStyleSheet(f"""
+            QLineEdit {{
+                background: {bg_color};
+                color: {text_color};
+                border: 1px solid transparent;
+                border-radius: 4px;
+                padding: 2px 5px;
+            }}
+            QLineEdit:hover {{
+                background: {hover_bg};
+            }}
+            QLineEdit:focus {{
+                border: 1px solid #3b82f6;
+                background: {bg_color};
+            }}
+        """)
         
         self.status_label = QLabel("Stopped")
         self.status_label.setStyleSheet(self._status_muted)
@@ -324,17 +452,49 @@ class MainWindow(QMainWindow):
 
         self.start_btn = QPushButton("Start Session")
         self.start_btn.clicked.connect(self._start_session)
-        self.start_btn.setMinimumHeight(35)
+        self.start_btn.setFixedHeight(35)
+
+        self.new_session_btn = QPushButton("+ New Session")
+        self.new_session_btn.clicked.connect(self._prepare_new_session)
+        self.new_session_btn.setFixedHeight(35)
+        new_bg = "#1a36b4"
+        new_hover = "#2563eb"
+        self.new_session_btn.setStyleSheet(f"""
+            QPushButton {{ background-color: {new_bg}; color: white; border: none; border-radius: 6px; padding: 8px 16px; font-weight: bold; }}
+            QPushButton:hover {{ background-color: {new_hover}; }}
+        """)
+        self.new_session_btn.setVisible(False)
+
+        self.map_btn = QPushButton("Generate Map")
+        self.map_btn.clicked.connect(self._generate_concept_map)
+        self.map_btn.setFixedHeight(35)
+        map_bg = "#8b5cf6"
+        map_hover = "#7c3aed"
+        self.map_btn.setStyleSheet(f"""
+            QPushButton {{ background-color: {map_bg}; color: white; border: none; border-radius: 6px; padding: 8px 16px; font-weight: bold; }}
+            QPushButton:hover {{ background-color: {map_hover}; }}
+            QPushButton:disabled {{ background-color: {'#334155' if self.dark else '#e2e8f0'}; color: {'#64748b' if self.dark else '#94a3b8'}; }}
+        """)
+        self.map_btn.setEnabled(False)
         
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.clicked.connect(self._stop_session)
-        self.stop_btn.setMinimumHeight(35)
+        self.stop_btn.setFixedHeight(35)
         self.stop_btn.setEnabled(False)
+        stop_bg = "#dc2626"
+        stop_hover = "#b91c1c"
+        self.stop_btn.setStyleSheet(f"""
+            QPushButton {{ background-color: {stop_bg}; color: white; border: none; border-radius: 6px; padding: 8px 16px; font-weight: bold; }}
+            QPushButton:hover {{ background-color: {stop_hover}; }}
+            QPushButton:disabled {{ background-color: {"#334155" if self.dark else "#e2e8f0"}; color: {"#64748b" if self.dark else "#94a3b8"}; }}
+        """)
 
-        top_bar.addWidget(self.title_label)
+        top_bar.addWidget(self.title_input, stretch=1)
         top_bar.addStretch()
         top_bar.addWidget(self.duration_label)
         top_bar.addWidget(self.status_label)
+        top_bar.addWidget(self.new_session_btn)
+        top_bar.addWidget(self.map_btn)
         top_bar.addWidget(self.start_btn)
         top_bar.addWidget(self.stop_btn)
         
@@ -349,27 +509,22 @@ class MainWindow(QMainWindow):
         self.track_label = QLabel("")
         self.track_label.setFont(QFont("Helvetica Neue", 13, QFont.Weight.Bold))
         self.track_label.setVisible(False)
+        self._was_off_track = False  # Track recovery state
 
         self.source_label = QLabel("")
         self.source_label.setFont(QFont("Helvetica Neue", 11))
         self.source_label.setVisible(False)
 
-        self.similarity_label = QLabel("")
-        self.similarity_label.setFont(QFont("Helvetica Neue", 12))
-        self.similarity_label.setStyleSheet(f"color: {self._muted_color.name()};")
-        self.similarity_label.setVisible(False)
-
         topic_bar.addWidget(self.topic_label)
         topic_bar.addWidget(self.source_label)
         topic_bar.addStretch()
         topic_bar.addWidget(self.track_label)
-        topic_bar.addWidget(self.similarity_label)
         main_view_layout.addLayout(topic_bar)
 
         drift_bg = "#fef2f2" if not self.dark else "#451a1a"
         drift_fg = "#dc2626" if not self.dark else "#fca5a5"
         drift_border = "#fecaca" if not self.dark else "#7f1d1d"
-        self.drift_banner = QLabel("Off topic -- the conversation has drifted from the agenda")
+        self.drift_banner = QLabel("The conversation appears to have drifted from the original topic.")
         self.drift_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.drift_banner.setStyleSheet(
             f"background-color: {drift_bg}; color: {drift_fg}; border: 1px solid {drift_border}; "
@@ -392,12 +547,99 @@ class MainWindow(QMainWindow):
         self.ollama_banner.setVisible(False)
         main_view_layout.addWidget(self.ollama_banner)
 
+        # Search bar for transcript
+        search_layout = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search transcript...")
+        self.search_input.setStyleSheet(
+            f"background: {'#334155' if self.dark else '#f1f5f9'}; "
+            f"color: {'#e2e8f0' if self.dark else '#1e293b'}; "
+            f"border: 1px solid {'#475569' if self.dark else '#cbd5e1'}; "
+            "border-radius: 4px; padding: 4px;"
+        )
+        self.search_input.returnPressed.connect(lambda: self._search_transcript(forward=True))
+        
+        self.search_prev_btn = QPushButton("Prev")
+        self.search_prev_btn.clicked.connect(lambda: self._search_transcript(forward=False))
+        
+        self.search_next_btn = QPushButton("Next")
+        self.search_next_btn.clicked.connect(lambda: self._search_transcript(forward=True))
+        
+        self.search_count_label = QLabel("")
+        self.search_count_label.setStyleSheet(f"color: {'#94a3b8' if self.dark else '#64748b'}; font-size: 12px;")
+        
+        search_layout.addWidget(QLabel("Search:"))
+        search_layout.addWidget(self.search_input)
+        search_layout.addWidget(self.search_count_label)
+        search_layout.addWidget(self.search_prev_btn)
+        search_layout.addWidget(self.search_next_btn)
+
         self.transcript_area = QTextEdit()
         self.transcript_area.setReadOnly(True)
         self.transcript_area.setFont(QFont("Helvetica Neue", 13))
-        # Remove border for cleaner look
         self.transcript_area.setFrameShape(QFrame.Shape.NoFrame)
-        main_view_layout.addWidget(self.transcript_area)
+
+        # Concept map widget
+        self.concept_map = ConceptMapWidget(dark=self.dark)
+
+        # Tabbed view: Transcript | Concept Map
+        self.tab_widget = QTabWidget()
+        tab_bg = '#1e293b' if self.dark else '#ffffff'
+        tab_fg = '#e2e8f0' if self.dark else '#1e293b'
+        tab_sel = '#1a36b4'
+        self.tab_widget.setStyleSheet(f"""
+            QTabWidget::pane {{ border: none; }}
+            QTabBar::tab {{
+                background: {'#334155' if self.dark else '#e2e8f0'};
+                color: {tab_fg};
+                padding: 8px 0px;
+                min-width: 150px;
+                margin-right: 2px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                font-weight: bold;
+                text-align: center;
+            }}
+            QTabBar::tab:selected {{ background: {tab_sel}; color: white; }}
+            QTabBar::tab:hover {{ background: {'#475569' if self.dark else '#cbd5e1'}; }}
+        """)
+        transcript_widget = QWidget()
+        transcript_layout = QVBoxLayout(transcript_widget)
+        transcript_layout.addLayout(search_layout)
+        transcript_layout.addWidget(self.transcript_area)
+
+        # Chat Search UI
+        chat_layout = QHBoxLayout()
+        self.chat_input = QLineEdit()
+        self.chat_input.setPlaceholderText("Ask LLM about this transcript or folder...")
+        self.chat_input.setStyleSheet(self.search_input.styleSheet())
+        self.chat_input.returnPressed.connect(self._ask_llm_about_transcript)
+        
+        self.chat_send_btn = QPushButton("Send")
+        self.chat_send_btn.clicked.connect(self._ask_llm_about_transcript)
+        self.chat_send_btn.setStyleSheet(f"""
+            QPushButton {{ background-color: #1a36b4; color: white; border: none; border-radius: 4px; padding: 4px 12px; font-weight: bold; }}
+            QPushButton:hover {{ background-color: #11247a; }}
+            QPushButton:disabled {{ background-color: {'#334155' if self.dark else '#e2e8f0'}; color: {'#64748b' if self.dark else '#94a3b8'}; }}
+        """)
+        
+        chat_layout.addWidget(self.chat_input)
+        chat_layout.addWidget(self.chat_send_btn)
+        
+        self.chat_output_area = QTextEdit()
+        self.chat_output_area.setReadOnly(True)
+        self.chat_output_area.setFont(QFont("Helvetica Neue", 12))
+        self.chat_output_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.chat_output_area.setStyleSheet(f"background: {'#1e293b' if self.dark else '#f8fafc'}; color: {'#94a3b8' if self.dark else '#475569'};")
+        self.chat_output_area.setMaximumHeight(150)
+        self.chat_output_area.setVisible(False)
+        
+        transcript_layout.addWidget(self.chat_output_area)
+        transcript_layout.addLayout(chat_layout)
+
+        self.tab_widget.addTab(transcript_widget, "Transcript")
+        self.tab_widget.addTab(self.concept_map, "Concept Map")
+        main_view_layout.addWidget(self.tab_widget)
 
         # Splitter setup
         splitter.addWidget(self.sidebar)
@@ -407,47 +649,81 @@ class MainWindow(QMainWindow):
     # ---- Tree View / Database Logic ----
     
     def _load_tree(self):
-        self.tree_model.clear()
-        root = self.tree_model.invisibleRootItem()
-        
-        folders = db.list_folders()
-        sessions = db.list_sessions()
-        
-        folder_items = {}
-        
-        # Add folders (root level for now, we can nest later if needed)
-        drop_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDropEnabled
-        drag_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
+        try:
+            self.tree_model.clear()
+            root = self.tree_model.invisibleRootItem()
+            
+            folders = db.list_folders()
+            sessions = db.list_sessions()
+            
+            folder_items = {}
+            last_folder_id = self.settings.get("last_folder_id")
+            target_index_to_select = None
+            
+            # Add folders (root level for now, we can nest later if needed)
+            drop_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDropEnabled
+            drag_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDragEnabled
 
-        for f in folders:
-            item = QStandardItem(f"📁 {f['name']}")
-            item.setData(f['id'], Qt.ItemDataRole.UserRole)
-            item.setData("folder", Qt.ItemDataRole.UserRole + 1)
-            item.setFlags(drop_flags)
-            folder_items[f['id']] = item
-            root.appendRow(item)
+            folder_font = QFont("Helvetica Neue", 14, QFont.Weight.Bold)
+            session_font = QFont("Helvetica Neue", 13)
 
-        uncategorized = QStandardItem("📁 Uncategorized")
-        uncategorized.setData(None, Qt.ItemDataRole.UserRole)
-        uncategorized.setData("folder", Qt.ItemDataRole.UserRole + 1)
-        uncategorized.setFlags(drop_flags)
-        root.appendRow(uncategorized)
-
-        for s in sessions:
-            title = s['title'] or "Untitled Session"
-            date_str = datetime.fromisoformat(s['started_at']).strftime("%b %d, %H:%M")
-            item = QStandardItem(f"🎙 {title} ({date_str})")
-            item.setData(s['id'], Qt.ItemDataRole.UserRole)
-            item.setData("session", Qt.ItemDataRole.UserRole + 1)
-            item.setFlags(drag_flags)
-
-            f_id = s.get('folder_id')
-            if f_id and f_id in folder_items:
-                folder_items[f_id].appendRow(item)
-            else:
-                uncategorized.appendRow(item)
+            for f in folders:
+                item = QStandardItem(f["name"])
+                item.setFont(folder_font)
+                item.setData(f['id'], Qt.ItemDataRole.UserRole)
+                item.setData("folder", Qt.ItemDataRole.UserRole + 1)
+                item.setFlags(drop_flags)
+                folder_items[f['id']] = item
+                root.appendRow(item)
                 
-        self.tree_view.expandAll()
+                if str(f['id']) == str(last_folder_id):
+                    target_index_to_select = item.index()
+
+            uncategorized = QStandardItem("Uncategorized")
+            uncategorized.setFont(folder_font)
+            uncategorized.setData(None, Qt.ItemDataRole.UserRole)
+            uncategorized.setData("folder", Qt.ItemDataRole.UserRole + 1)
+            uncategorized.setFlags(drop_flags)
+            root.appendRow(uncategorized)
+            
+            if last_folder_id is None:
+                target_index_to_select = uncategorized.index()
+
+            for s in sessions:
+                title = s['title'] or "Untitled Session"
+                date_str = datetime.fromisoformat(s['started_at']).strftime("%b %d, %H:%M")
+                item = QStandardItem(f"{title}  ·  {date_str}")
+                item.setFont(session_font)
+                item.setData(s['id'], Qt.ItemDataRole.UserRole)
+                item.setData("session", Qt.ItemDataRole.UserRole + 1)
+                item.setFlags(drag_flags)
+
+                f_id = s.get('folder_id')
+                if f_id and f_id in folder_items:
+                    folder_items[f_id].appendRow(item)
+                else:
+                    uncategorized.appendRow(item)
+
+            # Ensure all folders show the expand arrow even when empty
+            for folder_item in list(folder_items.values()) + [uncategorized]:
+                if folder_item.rowCount() == 0:
+                    placeholder = QStandardItem("(empty)")
+                    placeholder.setForeground(QBrush(self._muted_color))
+                    placeholder.setFont(QFont("Helvetica Neue", 11))
+                    placeholder.setData("placeholder", Qt.ItemDataRole.UserRole + 1)
+                    # Tell QTreeView to show the expand arrow for this parent
+                    folder_item.appendRow(placeholder)
+                    
+            self.tree_view.expandAll()
+            
+            # Default to previously viewed folder on app boot if not recording
+            if getattr(self, "current_session_id", None) is None and not (getattr(self, "engine", None) and self.engine.is_running):
+                if target_index_to_select and target_index_to_select.isValid():
+                    self.tree_view.setCurrentIndex(target_index_to_select)
+                    self._on_tree_clicked(target_index_to_select)
+                
+        except Exception as e:
+            print(f"Error loading session tree: {e}", file=sys.stderr)
 
     def _on_tree_context_menu(self, position):
         index = self.tree_view.indexAt(position)
@@ -457,12 +733,17 @@ class MainWindow(QMainWindow):
             item_type = self.tree_model.itemFromIndex(index).data(Qt.ItemDataRole.UserRole + 1)
             item_id = self.tree_model.itemFromIndex(index).data(Qt.ItemDataRole.UserRole)
             
-            if item_type == "folder" and item_id: # Not the fake 'Uncategorized' folder
-                rename_action = menu.addAction("Rename Folder")
-                rename_action.triggered.connect(lambda: self._action_rename_folder(item_id, index))
+            if item_type == "folder":
+                generate_action = menu.addAction("Generate Concept Map")
+                generate_action.triggered.connect(lambda: self._generate_folder_map(item_id, self.tree_model.itemFromIndex(index).text()))
+                menu.addSeparator()
                 
-                delete_action = menu.addAction("Delete Folder")
-                delete_action.triggered.connect(lambda: self._action_delete_folder(item_id))
+                if item_id is not None:
+                    rename_action = menu.addAction("Rename Folder")
+                    rename_action.triggered.connect(lambda: self._action_rename_folder(item_id, index))
+                    
+                    delete_action = menu.addAction("Delete Folder")
+                    delete_action.triggered.connect(lambda: self._action_delete_folder(item_id))
                 
             elif item_type == "session":
                 rename_action = menu.addAction("Rename Session")
@@ -483,9 +764,46 @@ class MainWindow(QMainWindow):
 
     def _on_tree_double_click(self, index: QModelIndex):
         item = self.tree_model.itemFromIndex(index)
-        if item.data(Qt.ItemDataRole.UserRole + 1) == "session":
-            session_id = item.data(Qt.ItemDataRole.UserRole)
-            self._load_session(session_id)
+        item_type = item.data(Qt.ItemDataRole.UserRole + 1)
+        item_id = item.data(Qt.ItemDataRole.UserRole)
+        if item_type == "session":
+            self._load_session(item_id)
+        elif item_type == "folder":
+            self._generate_folder_map(item_id, item.text())
+            
+    def _on_tree_clicked(self, index: QModelIndex):
+        item = self.tree_model.itemFromIndex(index)
+        item_type = item.data(Qt.ItemDataRole.UserRole + 1)
+        item_id = item.data(Qt.ItemDataRole.UserRole)
+        
+        # Prevent loading while recording
+        if self.engine and self.engine.is_running:
+            return
+            
+        if item_type == "folder":
+            sessions = db.get_folder_session_transcripts(item_id)
+            if sessions:
+                merged = "\n\n".join([f"--- Session: {s['title']} ---\n{s['transcript']}" for s in sessions if s.get('transcript')]).strip()
+            else:
+                merged = "No transcripts found in this folder."
+                
+            if merged:
+                self.current_session_id = None
+                self.title_input.setText(f"Folder: {item.text()}")
+                self.transcript_area.setPlainText(merged)
+                self.status_label.setText("Folder View")
+                self.status_label.setStyleSheet(self._status_muted)
+                
+                self.start_btn.setVisible(False)
+                self.stop_btn.setVisible(False)
+                self.new_session_btn.setVisible(True)
+                self.map_btn.setEnabled(True)
+                self.concept_map.clear_map()
+                self.duration_label.setText("")
+                
+                # Save as last viewed folder
+                self.settings["last_folder_id"] = item_id
+                self._save_settings()
 
     def _on_session_moved(self, session_id: str, folder_id):
         db.move_session_to_folder(session_id, folder_id)
@@ -496,46 +814,75 @@ class MainWindow(QMainWindow):
     def _action_new_folder(self):
         text, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
         if ok and text:
-            db.create_folder(text)
-            self._load_tree()
+            try:
+                db.create_folder(text)
+                self._load_tree()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to create folder:\n{str(e)}")
             
     def _action_rename_folder(self, folder_id, index):
-        old_name = self.tree_model.itemFromIndex(index).text().replace("📁 ", "")
+        old_name = self.tree_model.itemFromIndex(index).text()
         text, ok = QInputDialog.getText(self, "Rename Folder", "New folder name:", text=old_name)
         if ok and text:
-            db.rename_folder(folder_id, text)
-            self._load_tree()
+            try:
+                db.rename_folder(folder_id, text)
+                self._load_tree()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to rename folder:\n{str(e)}")
 
     def _action_delete_folder(self, folder_id):
         reply = QMessageBox.question(self, "Confirm Delete", "Delete this folder? Sessions inside will be uncategorized.", 
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
-            db.delete_folder(folder_id)
-            self._load_tree()
+            try:
+                db.delete_folder(folder_id)
+                self._load_tree()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to delete folder:\n{str(e)}")
 
     def _action_rename_session(self, session_id, index):
-        old_title = db.get_session(session_id)['title']
+        try:
+            old_title = db.get_session(session_id).get('title', "Session")
+        except Exception:
+            old_title = "Session"
+            
         text, ok = QInputDialog.getText(self, "Rename Session", "New title:", text=old_title)
         if ok and text:
-            db.update_session_title(session_id, text)
-            self._load_tree()
-            if self.current_session_id == session_id:
-                self.title_label.setText(text)
+            try:
+                db.update_session_title(session_id, text)
+                self._load_tree()
+                if self.current_session_id == session_id:
+                    self.title_input.setText(text)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to rename session:\n{str(e)}")
 
     def _action_delete_session(self, session_id):
         reply = QMessageBox.question(self, "Confirm Delete", "Delete this session permanently?", 
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
-            db.delete_session(session_id)
-            if self.current_session_id == session_id:
-                self.transcript_area.clear()
-                self.title_label.setText("New Session")
-                self.current_session_id = None
-            self._load_tree()
+            try:
+                db.delete_session(session_id)
+                # Delete corresponding audio folder
+                folder_path = Path("transcripts") / session_id
+                if folder_path.exists():
+                    import shutil
+                    shutil.rmtree(folder_path, ignore_errors=True)
+                    
+                if self.current_session_id == session_id:
+                    self.transcript_area.clear()
+                    self.title_input.setText("New Session")
+                    self.title_input.setEnabled(True)
+                    self.current_session_id = None
+                self._load_tree()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to delete session:\n{str(e)}")
 
     def _action_move_session(self, session_id, folder_id):
-        db.move_session_to_folder(session_id, folder_id)
-        self._load_tree()
+        try:
+            db.move_session_to_folder(session_id, folder_id)
+            self._load_tree()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to move session:\n{str(e)}")
 
     def _load_settings(self) -> dict:
         try:
@@ -552,12 +899,42 @@ class MainWindow(QMainWindow):
             json.dump(self.settings, f, indent=4)
 
     def _open_settings(self):
-        dialog = SettingsDialog(self, enable_ollama=self.settings.get("enable_ollama", True))
+        dialog = SettingsDialog(
+            self,
+            enable_ollama=self.settings.get("enable_ollama", True),
+            deepgram_enabled=self.settings.get("deepgram_enabled", False),
+            deepgram_api_key=self.settings.get("deepgram_api_key", ""),
+            llm_provider=self.settings.get("llm_provider", "ollama"),
+            gemini_api_key=self.settings.get("gemini_api_key", ""),
+        )
         if dialog.exec():
-            # If user clicked OK
-            new_enable = dialog.ollama_checkbox.isChecked()
-            if new_enable != self.settings.get("enable_ollama", True):
-                self.settings["enable_ollama"] = new_enable
+            changed = False
+            # Ollama
+            new_ollama = dialog.ollama_checkbox.isChecked()
+            if new_ollama != self.settings.get("enable_ollama", True):
+                self.settings["enable_ollama"] = new_ollama
+                changed = True
+            # LLM Provider
+            new_provider = "gemini" if dialog.radio_gemini.isChecked() else "ollama"
+            if new_provider != self.settings.get("llm_provider", "ollama"):
+                self.settings["llm_provider"] = new_provider
+                changed = True
+            # Gemini Key
+            new_gem_key = dialog.gemini_key_input.text().strip()
+            if new_gem_key != self.settings.get("gemini_api_key", ""):
+                self.settings["gemini_api_key"] = new_gem_key
+                changed = True
+            # Deepgram
+            new_dg = dialog.deepgram_checkbox.isChecked()
+            new_key = dialog.deepgram_key_input.text().strip()
+            if new_dg != self.settings.get("deepgram_enabled", False):
+                self.settings["deepgram_enabled"] = new_dg
+                changed = True
+            if new_key != self.settings.get("deepgram_api_key", ""):
+                self.settings["deepgram_api_key"] = new_key
+                changed = True
+            
+            if changed:
                 self._save_settings()
                 QMessageBox.information(
                     self,
@@ -615,6 +992,10 @@ class MainWindow(QMainWindow):
             ollama_model="llama3.2:1b",
             warmup_only=False,
             verbose_model=False,
+            deepgram_enabled=self.settings.get("deepgram_enabled", False),
+            deepgram_api_key=self.settings.get("deepgram_api_key", ""),
+            llm_provider=self.settings.get("llm_provider", "ollama"),
+            gemini_api_key=self.settings.get("gemini_api_key", ""),
         )
 
     def _start_session(self):
@@ -635,24 +1016,24 @@ class MainWindow(QMainWindow):
             self.source_label.setVisible(False)
             self.track_label.setText("")
             self.track_label.setVisible(True)
-            self.similarity_label.setText("")
-            self.similarity_label.setVisible(True)
 
-            selected = self.tree_view.selectedIndexes()
-            folder_id = None
-            if selected:
-                item = self.tree_model.itemFromIndex(selected[0])
-                if item.data(Qt.ItemDataRole.UserRole + 1) == "folder":
-                    folder_id = item.data(Qt.ItemDataRole.UserRole)
-                elif item.data(Qt.ItemDataRole.UserRole + 1) == "session":
-                    sess = db.get_session(item.data(Qt.ItemDataRole.UserRole))
-                    folder_id = sess.get('folder_id')
-
-            self.current_session_id = db.create_session(
-                model=self.engine.config.model,
-                folder_id=folder_id
-            )
-            self.title_label.setText("Recording...")
+            initial_topic = self.title_input.text().strip()
+            if initial_topic == "New Session" or not initial_topic:
+                initial_topic = None
+                
+            if not self.current_session_id:
+                selected = self.tree_view.selectedIndexes()
+                folder_id = None
+                if selected:
+                    item = self.tree_model.itemFromIndex(selected[0])
+                    if item.data(Qt.ItemDataRole.UserRole + 1) == "folder":
+                        folder_id = item.data(Qt.ItemDataRole.UserRole)
+    
+                self.current_session_id = db.create_session(
+                    model=self.engine.config.model,
+                    folder_id=folder_id
+                )
+            self.title_input.setText(initial_topic or "Recording...")
 
             def _start():
                 try:
@@ -661,14 +1042,52 @@ class MainWindow(QMainWindow):
                         time.sleep(0.1)
                     self.engine.enable_topic_tracking(
                         on_topic_inferred=self.signals.topic_inferred.emit,
+                        initial_topic=initial_topic or "New Session"
                     )
                     self.engine.start()
                 except Exception as exc:
+                    import traceback
+                    traceback.print_exc()
                     self.signals.status_changed.emit(f"error: {exc}")
 
             self.start_btn.setEnabled(False)
             self.start_btn.setText("Starting...")
+            self.title_input.setEnabled(False) # Disable title input when starting
+            self.new_session_btn.setVisible(False)
+            self.map_btn.setEnabled(False)
             threading.Thread(target=_start, daemon=True).start()
+
+    def _prepare_new_session(self):
+        """Reset the UI for a new recording session."""
+        if self.engine and self.engine.is_running:
+            QMessageBox.warning(self, "Recording", "Please stop the current recording first.")
+            return
+
+        self.current_session_id = None
+        self.title_input.setText("New Session")
+        self.title_input.setEnabled(True)
+        self.transcript_area.clear()
+        self.speaker_colors.clear()
+        self.speaker_idx = 0
+        self.elapsed_seconds = 0
+        self.duration_label.setText("00:00")
+        
+        self.status_label.setText("Ready")
+        self.status_label.setStyleSheet(self._status_muted)
+        
+        self.concept_map.clear_map()
+        self.tab_widget.setCurrentIndex(0)
+        
+        # Reset buttons
+        self.new_session_btn.setVisible(False)
+        self.start_btn.setVisible(True)
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setVisible(True)
+        self.stop_btn.setEnabled(False)
+        self.map_btn.setEnabled(False)
+        
+        # Clear tree selection
+        self.tree_view.clearSelection()
 
     def _stop_session(self):
         with self.engine_lock:
@@ -684,10 +1103,46 @@ class MainWindow(QMainWindow):
                             self.engine.get_transcript(),
                             self.engine.get_compressed_memory()
                         )
-                        # Auto-title
-                        utts = self.engine.get_utterances()
-                        if utts:
-                            db.update_session_title(self.current_session_id, utts[0].text[:60])
+                        # Auto-title ONLY if it doesn't already have one
+                        sess = db.get_session(self.current_session_id)
+                        if sess and (not sess['title'] or sess['title'] in ["New Session", "Recording...", "Untitled Session", "Started"]):
+                            final_transcript = self.engine.get_transcript()
+                            if final_transcript.strip():
+                                # Ask LLM for a title in the background
+                                model_config = getattr(self.engine, 'config', None)
+                                ollama_model = model_config.ollama_model if model_config else "deepseek-r1:8b"
+                                
+                                def _generate_title(sid, txt):
+                                    prompt = f"Analyze this transcript and write a concise 3-5 word title for the meeting. Output ONLY the title text, nothing else.\n\nTRANSCRIPT:\n{txt}"
+                                    try:
+                                        llm_provider = getattr(model_config, 'llm_provider', 'ollama')
+                                        if llm_provider == "gemini":
+                                            from main import ask_gemini
+                                            gemini_key = getattr(model_config, 'gemini_api_key', '')
+                                            title = ask_gemini(prompt, api_key=gemini_key)
+                                        else:
+                                            from main import ask_ollama
+                                            title = ask_ollama(prompt, model=ollama_model)
+                                            
+                                        if title:
+                                            title = title.strip(' "\'')
+                                            # Strip out `<think>` tags if the model leaked them
+                                            import re
+                                            title = re.sub(r'<think>.*?</think>', '', title, flags=re.DOTALL).strip()
+                                            
+                                            db.update_session_title(sid, title)
+                                            # Refresh to show new title
+                                            self.signals.status_changed.emit("__refresh_tree__")
+                                    except Exception as e:
+                                        print(f"Auto-title failed: {e}", file=sys.stderr)
+                                        
+                                threading.Thread(target=_generate_title, args=(self.current_session_id, final_transcript), daemon=True).start()
+                            else:
+                                db.update_session_title(self.current_session_id, "Empty Session")
+
+                        self.current_session_id = None
+                        
+                    self.signals.status_changed.emit("stopped")
                 except Exception as exc:
                     print(f"Stop error: {exc}")
                 finally:
@@ -695,6 +1150,7 @@ class MainWindow(QMainWindow):
                     QTimer.singleShot(0, self._load_tree)
 
             self.stop_btn.setEnabled(False)
+            self.title_input.setEnabled(True) # Re-enable title input when stopping
             threading.Thread(target=_stop, daemon=True).start()
 
     def _load_session(self, session_id):
@@ -702,40 +1158,393 @@ class MainWindow(QMainWindow):
         if self.engine and self.engine.is_running:
             QMessageBox.warning(self, "Recording", "Please stop the current recording first.")
             return
+        
+        try:
+            session = db.get_session(session_id)
+            if not session:
+                return
+                
+            self.current_session_id = session_id
+            self.title_input.setText(session['title'] or "Untitled Session")
+            self.transcript_area.clear()
+            self.speaker_colors.clear()
+            self.speaker_idx = 0
             
-        session = db.get_session(session_id)
+            self.elapsed_seconds = session.get('duration_seconds', 0)
+            self.duration_label.setText(self._format_time(self.elapsed_seconds))
+            
+            self.status_label.setText("Archived")
+            self.status_label.setStyleSheet(self._status_muted)
+            
+            # Switch buttons for archived map
+            self.start_btn.setVisible(False)
+            self.stop_btn.setVisible(False)
+            self.new_session_btn.setVisible(True)
+            self.map_btn.setEnabled(True)
+            
+            # Render utterances
+            for u in session['utterances']:
+                record = UtteranceRecord(
+                    index=u['index'], start_seconds=u['start_seconds'], end_seconds=u['end_seconds'],
+                    text=u['text'], raw_text="", speaker=u['speaker'], forced_split=False
+                )
+                self._on_utterance_gui(record, save_to_db=False)
+            
+            # Load existing concept map if available
+            existing_map = db.get_concept_map(session_id=session_id)
+            if existing_map:
+                self.concept_map.load_graph(existing_map['graph'])
+            else:
+                self.concept_map.clear_map()
+                
+        except Exception as e:
+            print(f"Error loading session: {e}", file=sys.stderr)
+            QMessageBox.warning(self, "Error", f"Failed to load session:\n{str(e)}")
+
+    def _generate_concept_map(self):
+        """Generate a concept map for the current session."""
+        if not self.current_session_id:
+            return
+        
+        session = db.get_session(self.current_session_id)
         if not session:
             return
-            
-        self.current_session_id = session_id
-        self.title_label.setText(session['title'] or "Untitled Session")
-        self.transcript_area.clear()
-        self.speaker_colors.clear()
-        self.speaker_idx = 0
         
-        self.elapsed_seconds = session.get('duration_seconds', 0)
-        self.duration_label.setText(self._format_time(self.elapsed_seconds))
-        
-        self.status_label.setText("Archived")
-        self.status_label.setStyleSheet(self._status_muted)
-        
-        # Render utterances
-        for u in session['utterances']:
-            # Create dummy UtteranceRecord for rendering
-            record = UtteranceRecord(
-                index=u['index'], start_seconds=u['start_seconds'], end_seconds=u['end_seconds'],
-                text=u['text'], raw_text="", speaker=u['speaker'], forced_split=False
+        # Use saved transcript, or build from utterances as fallback
+        transcript = session.get('transcript', '').strip()
+        if not transcript and session.get('utterances'):
+            transcript = "\n".join(
+                f"[{u.get('speaker', 'SPEAKER')}] {u['text']}"
+                for u in session['utterances'] if u.get('text', '').strip()
             )
-            self._on_utterance_gui(record, save_to_db=False)
+        
+        if not transcript:
+            QMessageBox.information(self, "No Content", "This session has no transcript content to map.")
+            return
+        
+        self.map_btn.setEnabled(False)
+        self.map_btn.setText("Generating...")
+        self.concept_map.show_generating("Sending transcript to Ollama...")
+        self.tab_widget.setCurrentIndex(1)  # Switch to Concept Map tab
+        session_id = self.current_session_id
+        model_config = getattr(self.engine, 'config', None)
+        ollama_model = model_config.ollama_model if model_config else "deepseek-r1:8b"
+        llm_provider = model_config.llm_provider if model_config else "ollama"
+        gemini_key = model_config.gemini_api_key if model_config else ""
+        
+        def _do_generate():
+            try:
+                self.signals.status_changed.emit("__map_status__Analyzing transcript with LLM...")
+                
+                # Callback to pipe stream thoughts to GUI
+                def _on_status(msg: str):
+                    self.signals.status_changed.emit(f"__map_status__{msg}")
+                    
+                graph = extract_concepts(
+                    transcript, 
+                    model=ollama_model,
+                    status_callback=_on_status,
+                    llm_provider=llm_provider,
+                    api_key=gemini_key
+                )
+                
+                self.signals.status_changed.emit("__map_status__Saving concept map...")
+                # Save to database
+                db.save_concept_map(
+                    graph_json=json.dumps(graph),
+                    session_id=session_id,
+                )
+                self._pending_map_graph = graph
+                # Signal the GUI thread
+                self.signals.status_changed.emit("__map_ready__")
+            except Exception as e:
+                print(f"Concept map generation failed: {e}", file=sys.stderr)
+                self.signals.status_changed.emit("__map_error__")
+        
+        threading.Thread(target=_do_generate, daemon=True).start()
+
+    def _check_map_result(self, status: str):
+        """Handle concept map generation result on the GUI thread."""
+        if status.startswith("__map_status__"):
+            msg = status[len("__map_status__"):]
+            self.concept_map.update_status(msg)
+            return
+        if status == "__map_ready__" or status == "__folder_map_ready__":
+            graph = self._pending_map_graph
+            self._pending_map_graph = None
+            if graph:
+                self.concept_map.load_graph(graph)
+                self.tab_widget.setCurrentIndex(1)  # Switch to Concept Map tab
+            self.map_btn.setEnabled(bool(self.current_session_id))
+            self.map_btn.setText("Generate Map")
+            if status == "__folder_map_ready__":
+                # Update title to remove generating status
+                current = self.title_input.text()
+                self.title_input.setText(current.replace(" (Generating...)", " (Folder Map)"))
+        elif status == "__map_error__":
+            self.map_btn.setEnabled(bool(self.current_session_id))
+            self.map_btn.setText("Generate Map")
+            self.concept_map.clear_map()
+            QMessageBox.warning(self, "Error", "Failed to generate concept map. Is Ollama running?")
+
+    def _search_transcript(self, forward: bool = True):
+        """Search the transcript text and highlight matches."""
+        query = self.search_input.text()
+        if not query:
+            self.search_count_label.setText("")
+            self.transcript_area.setExtraSelections([])
+            return
+
+        # Count total occurrences
+        text = self.transcript_area.toPlainText()
+        total_matches = text.lower().count(query.lower())
+        
+        if total_matches == 0:
+            self.search_count_label.setText("0 of 0")
+            # Change background to red briefly to indicate not found
+            self.search_input.setStyleSheet(
+                f"background: {'#7f1d1d' if self.dark else '#fee2e2'}; "
+                f"color: {'#fef2f2' if self.dark else '#991b1b'}; "
+                f"border: 1px solid {'#ef4444' if self.dark else '#f87171'}; "
+                "border-radius: 4px; padding: 4px;"
+            )
+            QTimer.singleShot(500, lambda: self.search_input.setStyleSheet(
+                f"background: {'#334155' if self.dark else '#f1f5f9'}; "
+                f"color: {'#e2e8f0' if self.dark else '#1e293b'}; "
+                f"border: 1px solid {'#475569' if self.dark else '#cbd5e1'}; "
+                "border-radius: 4px; padding: 4px;"
+            ))
+            self.transcript_area.setExtraSelections([])
+            return
+
+        # Find flag configurations
+        flags = QTextDocument.FindFlag(0)  # No flags by default
+        if not forward:
+            flags |= QTextDocument.FindFlag.FindBackward
+
+        found = self.transcript_area.find(query, flags)
+        
+        # Wrap around if not found
+        if not found:
+            cursor = self.transcript_area.textCursor()
+            cursor.movePosition(
+                QTextCursor.MoveOperation.End if not forward else QTextCursor.MoveOperation.Start
+            )
+            self.transcript_area.setTextCursor(cursor)
+            found = self.transcript_area.find(query, flags)
+
+        if found:
+            # Calculate current position index
+            cursor = self.transcript_area.textCursor()
+            pos = cursor.selectionStart()
+            # Count occurrences *before* this match
+            current_idx = text[:pos].lower().count(query.lower()) + 1
+            self.search_count_label.setText(f"{current_idx} of {total_matches}")
+
+            # Ensure the active match is visible
+            self.transcript_area.ensureCursorVisible()
+            
+            # Find and highlight ALL matches in the document
+            extra_selections = []
+            
+            # 1. Active match (Blue)
+            active_selection = QTextEdit.ExtraSelection()
+            active_bg = QColor("#0369a1" if self.dark else "#bae6fd")
+            active_fg = QColor("#ffffff" if self.dark else "#0f172a")
+            active_selection.format.setBackground(active_bg)
+            active_selection.format.setForeground(active_fg)
+            active_selection.cursor = cursor
+            extra_selections.append(active_selection)
+            
+            # 2. All other matches (Yellow)
+            bg_color = QColor("#ca8a04" if self.dark else "#fef08a")
+            fg_color = QColor("#ffffff" if self.dark else "#854d0e")
+            
+            doc = self.transcript_area.document()
+            highlight_cursor = QTextCursor(doc)
+            highlight_cursor.movePosition(QTextCursor.MoveOperation.Start)
+            
+            while True:
+                highlight_cursor = doc.find(query, highlight_cursor, flags)
+                if highlight_cursor.isNull():
+                    break
+                
+                # Skip the active selection since we already colored it differently
+                if highlight_cursor.selectionStart() != cursor.selectionStart():
+                    selection = QTextEdit.ExtraSelection()
+                    selection.format.setBackground(bg_color)
+                    selection.format.setForeground(fg_color)
+                    selection.cursor = highlight_cursor
+                    extra_selections.append(selection)
+            
+            self.transcript_area.setExtraSelections(extra_selections)
+
+    def _generate_folder_map(self, folder_id: str, folder_name: str):
+        """Generate a merged concept map for all sessions in a folder."""
+        # Switch buttons for archived map
+        self.start_btn.setVisible(False)
+        self.stop_btn.setVisible(False)
+        self.new_session_btn.setVisible(True)
+        
+        # Check for existing
+        existing = db.get_concept_map(folder_id=folder_id)
+        if existing:
+            self.concept_map.load_graph(existing['graph'])
+            self.title_input.setText(f"{folder_name} (Folder Map)")
+            self.tab_widget.setCurrentIndex(1)
+            self.map_btn.setEnabled(False)
+            return
+        
+        sessions = db.get_folder_session_transcripts(folder_id)
+        if not sessions:
+            QMessageBox.information(self, "Empty Folder", "This folder has no sessions with transcripts.")
+            return
+
+        self.title_input.setText(f"{folder_name} (Generating...)")
+        model_config = getattr(self.engine, 'config', None)
+        ollama_model = model_config.ollama_model if model_config else "deepseek-r1:8b"
+        llm_provider = model_config.llm_provider if model_config else "ollama"
+        gemini_key = model_config.gemini_api_key if model_config else ""
+        
+        def _do_folder_map():
+            try:
+                def _on_status(msg: str):
+                    self.signals.status_changed.emit(f"__map_status__{msg}")
+                
+                # Generate maps for each session that doesn't have one
+                session_maps = []
+                for i, s in enumerate(sessions):
+                    existing_map = db.get_concept_map(session_id=s['id'])
+                    if existing_map:
+                        session_maps.append({
+                            "session_id": s['id'],
+                            "title": s['title'],
+                            "graph": existing_map['graph'],
+                        })
+                    else:
+                        self.signals.status_changed.emit(f"__map_status__Extracting session {i+1}/{len(sessions)}...")
+                        graph = extract_concepts(s['transcript'], model=ollama_model, status_callback=_on_status, llm_provider=llm_provider, api_key=gemini_key)
+                        db.save_concept_map(graph_json=json.dumps(graph), session_id=s['id'])
+                        session_maps.append({
+                            "session_id": s['id'],
+                            "title": s['title'],
+                            "graph": graph,
+                        })
+                
+                # Merge
+                self.signals.status_changed.emit("__map_status__Merging all folder sessions...")
+                merged = merge_concept_maps(session_maps, model=ollama_model, status_callback=_on_status, llm_provider=llm_provider, api_key=gemini_key)
+                db.save_concept_map(graph_json=json.dumps(merged), folder_id=folder_id)
+                self._pending_map_graph = merged
+                self.signals.status_changed.emit("__folder_map_ready__")
+            except Exception as e:
+                print(f"Folder map generation failed: {e}", file=sys.stderr)
+                self.signals.status_changed.emit("__map_error__")
+        
+        threading.Thread(target=_do_folder_map, daemon=True).start()
+
+    def _ask_llm_about_transcript(self):
+        """Send the current transcript and user question to the LLM."""
+        question = self.chat_input.text().strip()
+        transcript = self.transcript_area.toPlainText().strip()
+        
+        # If the text area is empty, check if a folder is selected to use as context
+        if not transcript:
+            indexes = self.tree_view.selectedIndexes()
+            if indexes:
+                index = indexes[0]
+                item_type = self.tree_model.itemFromIndex(index).data(Qt.ItemDataRole.UserRole + 1)
+                item_id = self.tree_model.itemFromIndex(index).data(Qt.ItemDataRole.UserRole)
+                if item_type == "folder":
+                    sessions = db.get_folder_session_transcripts(item_id)
+                    if sessions:
+                        transcript = "\n\n".join([f"--- Session: {s['title']} ---\n{s['transcript']}" for s in sessions if s.get('transcript')]).strip()
+        
+        if not question or not transcript:
+            if not transcript:
+                QMessageBox.information(self, "No Context", "Please select a session or folder with a transcript to ask questions about.")
+            return
+            
+        self.chat_send_btn.setEnabled(False)
+        self.chat_output_area.setVisible(True)
+        self.chat_output_area.clear()
+        
+        # Format user question to show up instantly
+        user_color = "#3b82f6" if self.dark else "#2563eb"
+        
+        model = getattr(self.engine, 'config', None)
+        llm_provider = model.llm_provider if model and hasattr(model, 'llm_provider') else "ollama"
+        ai_name = "Gemini" if llm_provider == "gemini" else "Ollama"
+        
+        self.chat_output_area.append(f"<span style='color: {user_color}; font-weight: bold;'>You:</span> {question}")
+        self.chat_output_area.append(f"<span style='color: #8b5cf6; font-weight: bold;'>{ai_name}:</span> ")
+        
+        self.chat_input.clear()
+        
+        prompt = f"""You are a helpful assistant answering a question about a transcript.
+Use only the information provided in the transcript below to answer. If the answer is not in the transcript, say so.
+
+TRANSCRIPT:
+{transcript}
+
+QUESTION:
+{question}
+"""
+        def _stream_answer():
+            try:
+                if llm_provider == "gemini":
+                    from main import ask_gemini_stream
+                    gemini_key = model.gemini_api_key if model else ""
+                    for chunk in ask_gemini_stream(prompt, api_key=gemini_key):
+                        self.signals.status_changed.emit(f"__chat_chunk__{chunk}")
+                else:
+                    from main import ask_ollama_stream
+                    ollama_model = model.ollama_model if model else "deepseek-r1:8b"
+                    for chunk in ask_ollama_stream(prompt, model=ollama_model):
+                        self.signals.status_changed.emit(f"__chat_chunk__{chunk}")
+            except Exception as e:
+                self.signals.status_changed.emit(f"__chat_error__{str(e)}")
+            finally:
+                self.signals.status_changed.emit("__chat_done__")
+                
+        threading.Thread(target=_stream_answer, daemon=True).start()
 
     # ---- Callbacks (Running on Main Thread) ----
 
     def _on_status_gui(self, status: str):
+        # Handle chat signal chunks
+        if status.startswith("__chat_chunk__"):
+            chunk = status[len("__chat_chunk__"):]
+            # Ensure we append to the same line by inserting plain text at the end
+            cursor = self.chat_output_area.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText(chunk)
+            self.chat_output_area.ensureCursorVisible()
+            return
+        elif status.startswith("__chat_error__"):
+            err = status[len("__chat_error__"):]
+            self.chat_output_area.append(f"<br><span style='color: #ef4444;'>Error: {err}</span>")
+            return
+        elif status == "__chat_done__":
+            self.chat_send_btn.setEnabled(True)
+            self.chat_output_area.append("<br><br>") # padding for next question
+            return
+            
+        # Handle concept map signals
+        if status.startswith("__map_status__") or status.startswith("__folder_map_") or status.startswith("__map_error"):
+            self._check_map_result(status)
+            return
+            
+        if status == "__refresh_tree__":
+            self._load_tree()
+            return
+            
         if status.startswith("error"):
             self.status_label.setText("Error")
             self.status_label.setStyleSheet("color: #ef4444; font-weight: bold;")
             self.start_btn.setEnabled(True)
             self.start_btn.setText("Start Session")
+            self.title_input.setEnabled(True) # Re-enable title input on error
             return
             
         if status == "listening":
@@ -744,6 +1553,7 @@ class MainWindow(QMainWindow):
             self.start_btn.setText("Start Session")
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
+            self.title_input.setEnabled(False) # Disable title input when listening
             
             # Start timer
             self.start_time = datetime.now()
@@ -762,108 +1572,132 @@ class MainWindow(QMainWindow):
             self.duration_timer.stop()
             self.drift_banner.setVisible(False)
             self.track_label.setVisible(False)
-            self.similarity_label.setVisible(False)
 
     def _on_utterance_gui(self, record: UtteranceRecord, save_to_db=True):
-        if save_to_db and self.current_session_id:
-            db.save_utterance(
-                self.current_session_id, record.index, record.start_seconds, record.end_seconds,
-                record.text, record.raw_text, record.speaker, record.forced_split
-            )
+        try:
+            if save_to_db and self.current_session_id:
+                db.save_utterance(
+                    self.current_session_id, record.index, record.start_seconds, record.end_seconds,
+                    record.text, record.raw_text, record.speaker, record.forced_split
+                )
+                
+            # Render to text area
+            cursor = self.transcript_area.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
             
-        # Render to text area
-        cursor = self.transcript_area.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        
-        time_str = f"[{self._format_time(record.start_seconds)}] "
-        
-        fmt = QTextCharFormat()
-        fmt.setForeground(QBrush(self._muted_color))
-        cursor.insertText(time_str, fmt)
+            time_str = f"[{self._format_time(record.start_seconds)}] "
+            
+            fmt = QTextCharFormat()
+            fmt.setForeground(QBrush(self._muted_color))
+            cursor.insertText(time_str, fmt)
 
-        if record.speaker:
-            if record.speaker not in self.speaker_colors:
-                self.speaker_colors[record.speaker] = self._speaker_palette[self.speaker_idx % len(self._speaker_palette)]
-                self.speaker_idx += 1
+            if record.speaker:
+                if record.speaker not in self.speaker_colors:
+                    self.speaker_colors[record.speaker] = self._speaker_palette[self.speaker_idx % len(self._speaker_palette)]
+                    self.speaker_idx += 1
 
-            speaker_fmt = QTextCharFormat()
-            speaker_fmt.setForeground(QBrush(QColor(self.speaker_colors[record.speaker])))
-            speaker_fmt.setFontWeight(QFont.Weight.Bold)
-            cursor.insertText(f"[{record.speaker}] ", speaker_fmt)
+                speaker_fmt = QTextCharFormat()
+                speaker_fmt.setForeground(QBrush(QColor(self.speaker_colors[record.speaker])))
+                speaker_fmt.setFontWeight(QFont.Weight.Bold)
+                cursor.insertText(f"[{record.speaker}] ", speaker_fmt)
 
-        text_fmt = QTextCharFormat()
-        text_fmt.setForeground(QBrush(self._text_color))
-        cursor.insertText(f"{record.text}\n", text_fmt)
-        
-        self.transcript_area.setTextCursor(cursor)
-        self.transcript_area.ensureCursorVisible()
+            text_fmt = QTextCharFormat()
+            text_fmt.setForeground(QBrush(self._text_color))
+            cursor.insertText(f"{record.text}\n", text_fmt)
+            
+            self.transcript_area.setTextCursor(cursor)
+            self.transcript_area.ensureCursorVisible()
+        except Exception as e:
+            print(f"Error rendering utterance: {e}", file=sys.stderr)
 
     def _on_topic_inferred_gui(self, topic: str, source: str = "heuristic"):
-        self._current_topic = topic
-        self.topic_label.setText(f"Topic: {topic}")
-        self.title_label.setText(topic[:60])
-        if source == "ollama":
-            ollama_color = "#10b981" if self.dark else "#059669"
-            self.source_label.setText("⚡ Ollama")
-            self.source_label.setStyleSheet(f"color: {ollama_color}; font-size: 11px;")
-        else:
-            heuristic_color = "#f59e0b" if self.dark else "#d97706"
-            self.source_label.setText("◆ Heuristic")
-            self.source_label.setStyleSheet(f"color: {heuristic_color}; font-size: 11px;")
-        self.source_label.setVisible(True)
+        try:
+            self._current_topic = topic
+            self.topic_label.setText(f"Topic: {topic}")
+            # Only overwrite the title_input if the user hasn't manually set one this session
+            if self.title_input.text() in ("New Session", "Recording...", ""):
+                self.title_input.setText(topic[:60])
+                if self.current_session_id:
+                    db.update_session_title(self.current_session_id, topic[:60])
+                    self._load_tree()
+            if source == "ollama":
+                ollama_color = "#10b981" if self.dark else "#059669"
+                self.source_label.setText("LLM")
+                self.source_label.setStyleSheet(f"color: {ollama_color}; font-size: 11px; font-weight: bold;")
+            else:
+                heuristic_color = "#f59e0b" if self.dark else "#d97706"
+                self.source_label.setText("Heuristic")
+                self.source_label.setStyleSheet(f"color: {heuristic_color}; font-size: 11px; font-weight: bold;")
+            self.source_label.setVisible(True)
+        except Exception as e:
+            print(f"Error updating topic display: {e}", file=sys.stderr)
 
     def _on_ollama_status_gui(self, result: dict):
         status = result.get("status", "unavailable")
         model = result.get("model")
-        if status in ("ready", "started") and model:
+        if status == "gemini":
+            self.ollama_banner.setText("Using Gemini for topic detection.")
+            self.ollama_banner.setVisible(False)
+        elif status == "no_key":
+            self.ollama_banner.setText(
+                "Gemini topic detection selected but no API key is set. Using basic heuristics."
+            )
+            self.ollama_banner.setVisible(True)
+        elif status in ("ready", "started") and model:
             self.ollama_banner.setVisible(False)
             if status == "started":
                 print(f"Ollama auto-started with model: {model}", flush=True)
         elif status == "not_installed":
             self.ollama_banner.setText(
-                "ℹ️  Ollama is not installed — topic classification will use basic heuristics. "
+                "Ollama is not installed. Topic classification will use basic heuristics. "
                 "Install from ollama.com for smarter topic detection."
             )
             self.ollama_banner.setVisible(True)
         elif status in ("ready", "started") and not model:
             self.ollama_banner.setText(
-                "ℹ️  Ollama is running but no models are installed. "
+                "Ollama is running but no models are installed. "
                 "Run 'ollama pull deepseek-r1' to enable smart topic detection."
             )
             self.ollama_banner.setVisible(True)
         elif status == "disabled":
             self.ollama_banner.setText(
-                "ℹ️  Ollama topic detection is disabled in Settings. Using basic heuristics."
+                "AI topic detection is disabled in Settings. Using basic heuristics."
             )
             self.ollama_banner.setVisible(True)
         else:  # unavailable
             self.ollama_banner.setText(
-                "ℹ️  Could not reach Ollama — topic classification will use basic heuristics. "
+                "Could not reach Ollama. Topic classification will use basic heuristics. "
                 "Run 'ollama serve' for smarter topic detection."
             )
             self.ollama_banner.setVisible(True)
 
     def _on_drift_gui(self, similarity: float):
         self.drift_banner.setVisible(True)
-        self.track_label.setText("OFF TRACK")
+        self.track_label.setText("Off Track")
         self.track_label.setStyleSheet("color: #ef4444; font-weight: bold;")
+        self._was_off_track = True
 
     def _on_similarity_gui(self, similarity: float):
-        pct = int(similarity * 100)
         if similarity >= 0.5:
             color = "#10b981" if self.dark else "#059669"
-            self.track_label.setText("On Track")
-            self.track_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+            if self._was_off_track:
+                self.track_label.setText("Recovering")
+                recover_color = "#3b82f6" if self.dark else "#2563eb"
+                self.track_label.setStyleSheet(f"color: {recover_color}; font-weight: bold;")
+                self._was_off_track = False
+            else:
+                self.track_label.setText("On Track")
+                self.track_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+            self.drift_banner.setVisible(False)
         elif similarity >= 0.35:
             color = "#f59e0b" if self.dark else "#d97706"
-            self.track_label.setText("Drifting...")
+            self.track_label.setText("Drifting")
             self.track_label.setStyleSheet(f"color: {color}; font-weight: bold;")
-        else:
-            color = "#ef4444"
-        self.similarity_label.setText(f"{pct}%")
-        self.similarity_label.setStyleSheet(f"color: {color}; font-weight: bold;")
-        if similarity >= 0.35:
             self.drift_banner.setVisible(False)
+        else:
+            self.track_label.setText("Off Track")
+            self.track_label.setStyleSheet("color: #ef4444; font-weight: bold;")
+            self._was_off_track = True
 
     def _update_duration(self):
         if self.start_time:
