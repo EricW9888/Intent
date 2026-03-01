@@ -1,3 +1,8 @@
 {
-    "enable_ollama": false
+    "enable_ollama": true,
+    "deepgram_enabled": true,
+    "deepgram_api_key": "13781f990ad60f71965b5a7a55399cbcb5e4964c",
+    "llm_provider": "gemini",
+    "gemini_api_key": "GEMINI_API_KEY= AIzaSyB6o9cqUjWxNsf4WYEFF5OezfSw8JUmc7g",
+    "last_folder_id": null
 }
