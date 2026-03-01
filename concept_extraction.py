@@ -54,24 +54,64 @@ Merged JSON:"""
 
 
 def _parse_json_response(text: str) -> dict[str, Any] | None:
-    """Extract JSON from an Ollama response, handling markdown fences."""
+    """Extract JSON from an LLM response, handling markdown fences and lead-in text."""
     if not text:
         return None
-    # Strip markdown code fences if present
-    text = re.sub(r"^```(?:json)?\s*\n?", "", text.strip())
-    text = re.sub(r"\n?```\s*$", "", text.strip())
+    
+    # Strip <think> tags if they exist (DeepSeek-style)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    
+    # Try direct parsing first
     try:
         data = json.loads(text)
-        if "nodes" in data and "edges" in data:
+        if isinstance(data, dict) and "nodes" in data:
             return data
     except json.JSONDecodeError:
-        # Try to find JSON object in the response
-        match = re.search(r'\{[\s\S]*"nodes"[\s\S]*"edges"[\s\S]*\}', text)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
+        pass
+        
+    # Look for JSON block in markdown
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+            
+    # Brute force: find the first { and the last }
+    # This is more robust for models that "talk" before or after the JSON
+    start = text.find('{')
+    end = text.rfind('}')
+    
+    if start != -1 and end != -1 and end > start:
+        json_str = text[start:end+1]
+        try:
+            data = json.loads(json_str)
+            if isinstance(data, dict) and "nodes" in data:
+                return data
+        except json.JSONDecodeError:
+            # Final attempt: try to fix common JSON errors like trailing commas
+            # or extra text slightly inside the braces.
+            # Use balanced brace counting to find the actual JSON end
+            obj_str = ""
+            brace_count = 0
+            found_start = False
+            for char in text[start:]:
+                if char == '{':
+                    brace_count += 1
+                    found_start = True
+                elif char == '}':
+                    brace_count -= 1
+                
+                obj_str += char
+                if found_start and brace_count == 0:
+                    try:
+                        data = json.loads(obj_str)
+                        if isinstance(data, dict) and "nodes" in data:
+                            return data
+                    except json.JSONDecodeError:
+                        break
+                    break
+            
     return None
 
 
@@ -114,7 +154,8 @@ def extract_concepts(
     model: str = "deepseek-r1:8b",
     status_callback: Callable[[str], None] | None = None,
     llm_provider: str = "ollama",
-    api_key: str = ""
+    api_key: str = "",
+    gemini_model: str = "gemini-1.5-flash"
 ) -> dict[str, Any]:
     """Extract a concept map from a transcript using Ollama or Gemini.
     
@@ -140,7 +181,7 @@ def extract_concepts(
     
     if llm_provider == "gemini":
         from main import ask_gemini_stream
-        stream = ask_gemini_stream(prompt, api_key=api_key)
+        stream = ask_gemini_stream(prompt, api_key=api_key, model=gemini_model)
     else:
         stream = ask_ollama_stream(prompt, model=model)
         
@@ -187,7 +228,8 @@ def merge_concept_maps(
     model: str = "deepseek-r1:8b",
     status_callback: Callable[[str], None] | None = None,
     llm_provider: str = "ollama",
-    api_key: str = ""
+    api_key: str = "",
+    gemini_model: str = "gemini-1.5-flash"
 ) -> dict[str, Any]:
     """Merge concept maps from multiple sessions using Ollama or Gemini.
     
@@ -230,7 +272,7 @@ def merge_concept_maps(
     
     if llm_provider == "gemini":
         from main import ask_gemini_stream
-        stream = ask_gemini_stream(prompt, api_key=api_key)
+        stream = ask_gemini_stream(prompt, api_key=api_key, model=gemini_model)
     else:
         stream = ask_ollama_stream(prompt, model=model)
         

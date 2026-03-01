@@ -1,13 +1,11 @@
 # Intent – Local, Context-Aware Speech Transcription
 
-Intent is a local-first speech-to-text tool with live context compression, optional speaker diarization, topic drift detection, and a PyQt GUI. It defaults to the open-source Whisper models via `faster-whisper` and can optionally use Gemini or local Ollama for topic detection. No cloud calls are required unless you opt into Gemini or Deepgram.
+Intent is a local-first speech-to-text tool to keep meetings on track, with topic drift detection, mind maps from transcriptions, and a PyQt GUI. It defaults to the open-source Whisper models via `faster-whisper` and can optionally use Gemini or local Ollama for topic detection. No cloud calls are required unless you choose to use Gemini or Deepgram.
 
 ## Features
-- Live mic transcription with adaptive VAD and overlap handling to avoid boundary word loss.
-- Rolling context: keeps recent verbatim text; compresses older text into summary, key terms, and open threads within a small budget.
-- Optional hallucination filtering and artifact cleanup to reduce Whisper repetition.
-- Optional speaker diarization with persistent profiles (SpeechBrain ECAPA).
-- Topic tracking and off-topic detection using your chosen AI provider (Gemini or local Ollama).
+- Live mic transcription with adaptive voice activity detection and overlap handling to avoid boundary word loss.
+- Rolling context: keeps recent verbatim text
+- Topic tracking and off-topic detection using heuristics, backe up occasionally by a chosen AI provider (Gemini or local Ollama).
 - Optional Deepgram fallback for transcription and optional Deepgram TTS warnings.
 - PyQt GUI: session/folder tree, transcript view, concept map tab, settings for AI provider and Deepgram.
 - Outputs plain text transcripts and JSON metadata per session.
@@ -49,8 +47,6 @@ python main.py --notes "Acme, Orion API, Sara Patel"
 Outputs land in `transcripts/live_YYYYMMDD_HHMMSS.txt` plus matching `.json`.
 
 Useful flags:
-- `--no-diarize` to disable speaker tracking; `--speakers-file speakers.json` to persist profiles.
-- `--no-hallucination-filter` to keep raw output.
 - `--llm-provider gemini --gemini-api-key YOUR_KEY` to use Gemini for topic detection.
 - `--llm-provider ollama --ollama-model llama3.2:1b` to use a local Ollama model.
 - `--deepgram-enabled --deepgram-api-key YOUR_KEY` to use Deepgram instead of local Whisper.

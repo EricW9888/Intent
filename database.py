@@ -119,6 +119,13 @@ def rename_folder(folder_id: str, new_name: str, db_path: Path = DB_PATH) -> Non
     conn.close()
 
 
+def update_folder_parent(folder_id: str, parent_id: str | None, db_path: Path = DB_PATH) -> None:
+    conn = _connect(db_path)
+    conn.execute("UPDATE folders SET parent_id = ? WHERE id = ?", (parent_id, folder_id))
+    conn.commit()
+    conn.close()
+
+
 def delete_folder(folder_id: str, db_path: Path = DB_PATH) -> bool:
     conn = _connect(db_path)
     conn.execute("UPDATE sessions SET folder_id = NULL WHERE folder_id = ?", (folder_id,))
@@ -383,15 +390,38 @@ def get_concept_map(session_id: str | None = None, folder_id: str | None = None,
 def get_folder_session_transcripts(folder_id: str | None, db_path: Path = DB_PATH) -> list[dict[str, Any]]:
     """Get all session transcripts in a folder for building folder-level maps."""
     conn = _connect(db_path)
-    if folder_id is None:
+    
+    # 1. Get all subfolder IDs recursively
+    folder_ids = []
+    if folder_id is not None:
+        folder_ids.append(folder_id)
+        # Simple recursive search (SQLite 3.8.3+ supports recursive CTEs which would be cleaner, 
+        # but this is safer for portable scripts)
+        to_check = [folder_id]
+        while to_check:
+            current_id = to_check.pop(0)
+            subs = conn.execute("SELECT id FROM folders WHERE parent_id = ?", (current_id,)).fetchall()
+            for s in subs:
+                folder_ids.append(s["id"])
+                to_check.append(s["id"])
+    
+    # 2. Fetch sessions
+    if not folder_ids and folder_id is not None:
+        # Requested a folder that doesn't exist or we started with None (Uncategorized)
+        rows = []
+    elif folder_id is None:
+        # Uncategorized: sessions where folder_id IS NULL
         rows = conn.execute(
             "SELECT id, title, transcript FROM sessions WHERE folder_id IS NULL ORDER BY started_at"
         ).fetchall()
     else:
+        # Specific folder + its subfolders
+        placeholders = ",".join("?" for _ in folder_ids)
         rows = conn.execute(
-            "SELECT id, title, transcript FROM sessions WHERE folder_id = ? ORDER BY started_at",
-            (folder_id,),
+            f"SELECT id, title, transcript FROM sessions WHERE folder_id IN ({placeholders}) ORDER BY started_at",
+            folder_ids
         ).fetchall()
+
     results = []
     for r in rows:
         transcript = r["transcript"] or ""

@@ -117,7 +117,7 @@ class AppConfig:
     deepgram_api_key: str = ""
     llm_provider: str = "ollama"
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-1.5-flash"
 
 
 @dataclass
@@ -512,6 +512,10 @@ def parse_args() -> AppConfig:
         ollama_model=args.ollama_model,
         warmup_only=args.warmup_only,
         verbose_model=args.verbose_model,
+        deepgram_enabled=args.deepgram_enabled,
+        deepgram_api_key=args.deepgram_api_key,
+        llm_provider=args.llm_provider,
+        gemini_api_key=args.gemini_api_key,
     )
 
     if args.list_devices:
@@ -617,7 +621,7 @@ def load_local_model(config: AppConfig) -> WhisperModel:
     return model
 
 
-def ask_gemini(prompt: str, api_key: str, model: str = "gemini-2.5-flash", timeout: int = 30) -> str | None:
+def ask_gemini(prompt: str, api_key: str, model: str = "gemini-1.5-flash", timeout: int = 30) -> str | None:
     """Query Google Gemini API via REST. Returns the response text, or None on any failure."""
     if not api_key:
         print("Gemini API key is missing.", file=sys.stderr)
@@ -642,7 +646,7 @@ def ask_gemini(prompt: str, api_key: str, model: str = "gemini-2.5-flash", timeo
         print(f"Gemini API error: {e}", file=sys.stderr)
         return None
 
-def ask_gemini_stream(prompt: str, api_key: str, model: str = "gemini-2.5-flash", timeout: int = 60):
+def ask_gemini_stream(prompt: str, api_key: str, model: str = "gemini-1.5-flash", timeout: int = 60):
     """Query Google Gemini API via REST and yield response chunks."""
     if not api_key:
         yield "Error: Gemini API key is missing. Please configure it in Settings."
@@ -930,8 +934,9 @@ def hotwords_from_notes(notes: str) -> str | None:
 def speak_warning(message: str) -> None:
     """Play a spoken warning through macOS text-to-speech (non-blocking)."""
     try:
+        # Use system default voice for better compatibility
         subprocess.Popen(
-            ["say", "-v", "Samantha", message],
+            ["say", message],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -1500,6 +1505,7 @@ class TranscriberEngine:
 
         segments = []
         deepgram_speaker = ""
+        speaker = ""
         
         if self.config.deepgram_enabled and self.config.deepgram_api_key:
             segments, deepgram_speaker = self._transcribe_utterance_deepgram(utterance)

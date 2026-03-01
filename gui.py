@@ -109,50 +109,77 @@ def _build_stylesheet(dark: bool) -> str:
     """
 
 MIME_SESSION_ID = "application/x-intent-session-id"
+MIME_FOLDER_ID = "application/x-intent-folder-id"
 
 
 class SessionTreeModel(QStandardItemModel):
-    """Custom model that only allows dragging sessions onto folders."""
+    """Custom model that allows dragging sessions and folders onto folders."""
 
     session_moved = pyqtSignal(str, object)  # session_id, folder_id (str or None)
+    folder_moved = pyqtSignal(str, object)   # folder_id, parent_id (str or None)
 
     def supportedDropActions(self):
         return Qt.DropAction.MoveAction
 
     def mimeTypes(self):
-        return [MIME_SESSION_ID]
+        return [MIME_SESSION_ID, MIME_FOLDER_ID]
 
     def mimeData(self, indexes):
         mime = QMimeData()
         for index in indexes:
             item = self.itemFromIndex(index)
-            if item and item.data(Qt.ItemDataRole.UserRole + 1) == "session":
+            if not item: continue
+            if item.data(Qt.ItemDataRole.UserRole + 1) == "session":
                 mime.setData(MIME_SESSION_ID, item.data(Qt.ItemDataRole.UserRole).encode())
                 return mime
+            elif item.data(Qt.ItemDataRole.UserRole + 1) == "folder":
+                f_id = item.data(Qt.ItemDataRole.UserRole)
+                if f_id: # Don't drag Uncategorized
+                    mime.setData(MIME_FOLDER_ID, f_id.encode())
+                    return mime
         return mime
 
     def canDropMimeData(self, data, action, row, column, parent):
-        if not data.hasFormat(MIME_SESSION_ID):
+        if not (data.hasFormat(MIME_SESSION_ID) or data.hasFormat(MIME_FOLDER_ID)):
             return False
+        
         target = self.itemFromIndex(parent)
+        # Drop onto background -> moving to root (None folder_id)
         if target is None:
+            return True
+        
+        if target.data(Qt.ItemDataRole.UserRole + 1) != "folder":
             return False
-        return target.data(Qt.ItemDataRole.UserRole + 1) == "folder"
+            
+        # Prevention: Folder cannot be dropped into itself or its descendants
+        if data.hasFormat(MIME_FOLDER_ID):
+            moving_id = bytes(data.data(MIME_FOLDER_ID)).decode()
+            curr = target
+            while curr:
+                if curr.data(Qt.ItemDataRole.UserRole) == moving_id:
+                    return False # Cycle detected
+                curr = curr.parent()
+        
+        return True
 
     def dropMimeData(self, data, action, row, column, parent):
-        if not data.hasFormat(MIME_SESSION_ID):
-            return False
         target = self.itemFromIndex(parent)
-        if target is None or target.data(Qt.ItemDataRole.UserRole + 1) != "folder":
-            return False
-        session_id = bytes(data.data(MIME_SESSION_ID)).decode()
-        folder_id = target.data(Qt.ItemDataRole.UserRole)
-        self.session_moved.emit(session_id, folder_id)
-        return True
+        folder_id = target.data(Qt.ItemDataRole.UserRole) if target else None
+        
+        if data.hasFormat(MIME_SESSION_ID):
+            session_id = bytes(data.data(MIME_SESSION_ID)).decode()
+            self.session_moved.emit(session_id, folder_id)
+            return True
+        elif data.hasFormat(MIME_FOLDER_ID):
+            moving_folder_id = bytes(data.data(MIME_FOLDER_ID)).decode()
+            self.folder_moved.emit(moving_folder_id, folder_id)
+            return True
+            
+        return False
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None, enable_ollama=True, deepgram_enabled=False, deepgram_api_key="", llm_provider="ollama", gemini_api_key=""):
+    def __init__(self, parent=None, enable_ollama=True, deepgram_enabled=False, deepgram_api_key="", llm_provider="ollama", gemini_api_key="", gemini_model="gemini-1.5-flash"):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setFixedSize(420, 340)
@@ -198,6 +225,15 @@ class SettingsDialog(QDialog):
         gemini_key_layout.addWidget(self.gemini_key_input)
         layout.addLayout(gemini_key_layout)
         
+        gemini_model_layout = QHBoxLayout()
+        gemini_model_label = QLabel("Gemini Model:")
+        gemini_model_layout.addWidget(gemini_model_label)
+        self.gemini_model_input = QLineEdit()
+        self.gemini_model_input.setPlaceholderText("e.g. gemini-1.5-flash")
+        self.gemini_model_input.setText(gemini_model)
+        gemini_model_layout.addWidget(self.gemini_model_input)
+        layout.addLayout(gemini_model_layout)
+        
         # Set initial values
         if llm_provider == "gemini":
             self.radio_gemini.setChecked(True)
@@ -207,6 +243,7 @@ class SettingsDialog(QDialog):
             self.gemini_key_input.setEnabled(False)
             
         self.radio_gemini.toggled.connect(self.gemini_key_input.setEnabled)
+        self.radio_gemini.toggled.connect(self.gemini_model_input.setEnabled)
         
         # --- Separator ---
         line = QFrame()
@@ -281,6 +318,7 @@ class MainWindow(QMainWindow):
         self._map_ready_signal = pyqtSignal  # placeholder
         self.signals.status_changed.connect(self._check_map_result)  # reuse status for simplicity
         self._pending_map_graph = None
+        self._target_index_to_select = None
 
         self.speaker_colors: dict[str, str] = {}
         self.speaker_idx = 0
@@ -395,6 +433,7 @@ class MainWindow(QMainWindow):
 
         self.tree_model = SessionTreeModel()
         self.tree_model.session_moved.connect(self._on_session_moved)
+        self.tree_model.folder_moved.connect(self._on_folder_moved)
         self.tree_view.setModel(self.tree_model)
         sidebar_layout.addWidget(self.tree_view)
 
@@ -658,7 +697,7 @@ class MainWindow(QMainWindow):
             
             folder_items = {}
             last_folder_id = self.settings.get("last_folder_id")
-            target_index_to_select = None
+            self._target_index_to_select = None
             
             # Add folders (root level for now, we can nest later if needed)
             drop_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsDropEnabled
@@ -667,18 +706,25 @@ class MainWindow(QMainWindow):
             folder_font = QFont("Helvetica Neue", 14, QFont.Weight.Bold)
             session_font = QFont("Helvetica Neue", 13)
 
+            # 1. Create all folder items first
             for f in folders:
                 item = QStandardItem(f["name"])
                 item.setFont(folder_font)
                 item.setData(f['id'], Qt.ItemDataRole.UserRole)
                 item.setData("folder", Qt.ItemDataRole.UserRole + 1)
-                item.setFlags(drop_flags)
+                item.setFlags(drop_flags | drag_flags) 
                 folder_items[f['id']] = item
-                root.appendRow(item)
-                
-                if str(f['id']) == str(last_folder_id):
-                    target_index_to_select = item.index()
 
+            # 2. Build folder hierarchy
+            for f in folders:
+                item = folder_items[f['id']]
+                p_id = f.get('parent_id')
+                if p_id and p_id in folder_items:
+                    folder_items[p_id].appendRow(item)
+                else:
+                    root.appendRow(item)
+
+            # 3. Add Uncategorized (always root level)
             uncategorized = QStandardItem("Uncategorized")
             uncategorized.setFont(folder_font)
             uncategorized.setData(None, Qt.ItemDataRole.UserRole)
@@ -687,7 +733,7 @@ class MainWindow(QMainWindow):
             root.appendRow(uncategorized)
             
             if last_folder_id is None:
-                target_index_to_select = uncategorized.index()
+                self._target_index_to_select = uncategorized.index()
 
             for s in sessions:
                 title = s['title'] or "Untitled Session"
@@ -704,25 +750,37 @@ class MainWindow(QMainWindow):
                 else:
                     uncategorized.appendRow(item)
 
-            # Ensure all folders show the expand arrow even when empty
-            for folder_item in list(folder_items.values()) + [uncategorized]:
-                if folder_item.rowCount() == 0:
-                    placeholder = QStandardItem("(empty)")
-                    placeholder.setForeground(QBrush(self._muted_color))
-                    placeholder.setFont(QFont("Helvetica Neue", 11))
-                    placeholder.setData("placeholder", Qt.ItemDataRole.UserRole + 1)
-                    # Tell QTreeView to show the expand arrow for this parent
-                    folder_item.appendRow(placeholder)
+            # 5. Handle empty folders and selection
+            def _post_process(parent_item):
+                item_type = parent_item.data(Qt.ItemDataRole.UserRole + 1)
+                if item_type == "folder":
+                    f_id = parent_item.data(Qt.ItemDataRole.UserRole)
+                    if str(f_id) == str(last_folder_id):
+                        self._target_index_to_select = parent_item.index()
+
+                    if parent_item.rowCount() == 0:
+                        placeholder = QStandardItem("(empty)")
+                        placeholder.setForeground(QBrush(self._muted_color))
+                        placeholder.setFont(QFont("Helvetica Neue", 11))
+                        placeholder.setData("placeholder", Qt.ItemDataRole.UserRole + 1)
+                        parent_item.appendRow(placeholder)
+                    else:
+                        for i in range(parent_item.rowCount()):
+                            _post_process(parent_item.child(i))
+
+            for i in range(root.rowCount()):
+                _post_process(root.child(i))
                     
             self.tree_view.expandAll()
             
-            # Default to previously viewed folder on app boot if not recording
             if getattr(self, "current_session_id", None) is None and not (getattr(self, "engine", None) and self.engine.is_running):
-                if target_index_to_select and target_index_to_select.isValid():
-                    self.tree_view.setCurrentIndex(target_index_to_select)
-                    self._on_tree_clicked(target_index_to_select)
+                if self._target_index_to_select and self._target_index_to_select.isValid():
+                    self.tree_view.setCurrentIndex(self._target_index_to_select)
+                    self._on_tree_clicked(self._target_index_to_select)
                 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"Error loading session tree: {e}", file=sys.stderr)
 
     def _on_tree_context_menu(self, position):
@@ -806,8 +864,18 @@ class MainWindow(QMainWindow):
                 self._save_settings()
 
     def _on_session_moved(self, session_id: str, folder_id):
-        db.move_session_to_folder(session_id, folder_id)
-        self._load_tree()
+        try:
+            db.move_session_to_folder(session_id, folder_id)
+            self._load_tree()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to move session:\n{str(e)}")
+
+    def _on_folder_moved(self, folder_id: str, parent_id: str | None):
+        try:
+            db.update_folder_parent(folder_id, parent_id)
+            self._load_tree()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to move folder:\n{str(e)}")
 
     # ---- Actions ----
 
@@ -884,19 +952,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to move session:\n{str(e)}")
 
-    def _load_settings(self) -> dict:
-        try:
-            with open("settings.json", "r") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return {} # Default settings
-        except json.JSONDecodeError:
-            print("Warning: Could not decode settings.json. Using default settings.")
-            return {}
-
-    def _save_settings(self):
-        with open("settings.json", "w") as f:
-            json.dump(self.settings, f, indent=4)
 
     def _open_settings(self):
         dialog = SettingsDialog(
@@ -906,6 +961,7 @@ class MainWindow(QMainWindow):
             deepgram_api_key=self.settings.get("deepgram_api_key", ""),
             llm_provider=self.settings.get("llm_provider", "ollama"),
             gemini_api_key=self.settings.get("gemini_api_key", ""),
+            gemini_model=self.settings.get("gemini_model", "gemini-1.5-flash"),
         )
         if dialog.exec():
             changed = False
@@ -933,14 +989,20 @@ class MainWindow(QMainWindow):
             if new_key != self.settings.get("deepgram_api_key", ""):
                 self.settings["deepgram_api_key"] = new_key
                 changed = True
+            # Gemini Model
+            new_gem_model = dialog.gemini_model_input.text().strip()
+            if new_gem_model != self.settings.get("gemini_model", "gemini-1.5-flash"):
+                self.settings["gemini_model"] = new_gem_model
+                changed = True
             
             if changed:
                 self._save_settings()
-                QMessageBox.information(
-                    self,
-                    "Restart Required",
-                    "Settings saved. Please restart the application for changes to take effect."
-                )
+                # Update engine config immediately if it exists
+                if self.engine:
+                    self.engine.config = self._make_config()
+                
+                self.status_label.setText("Settings Updated")
+                QTimer.singleShot(2000, lambda: self.status_label.setText("Ready"))
 
     # ---- Engine Integration ----
 
@@ -996,12 +1058,16 @@ class MainWindow(QMainWindow):
             deepgram_api_key=self.settings.get("deepgram_api_key", ""),
             llm_provider=self.settings.get("llm_provider", "ollama"),
             gemini_api_key=self.settings.get("gemini_api_key", ""),
+            gemini_model=self.settings.get("gemini_model", "gemini-1.5-flash"),
         )
 
     def _start_session(self):
         with self.engine_lock:
             if self.engine and self.engine.is_running:
                 return
+
+            # Refresh config from settings before starting
+            self.engine.config = self._make_config()
 
             self.transcript_area.clear()
             self.speaker_colors.clear()
@@ -1240,12 +1306,15 @@ class MainWindow(QMainWindow):
                 def _on_status(msg: str):
                     self.signals.status_changed.emit(f"__map_status__{msg}")
                     
+                gemini_model = self.settings.get("gemini_model", "gemini-1.5-flash")
+                
                 graph = extract_concepts(
                     transcript, 
                     model=ollama_model,
                     status_callback=_on_status,
                     llm_provider=llm_provider,
-                    api_key=gemini_key
+                    api_key=gemini_key,
+                    gemini_model=gemini_model
                 )
                 
                 self.signals.status_changed.emit("__map_status__Saving concept map...")
@@ -1422,8 +1491,15 @@ class MainWindow(QMainWindow):
                             "graph": existing_map['graph'],
                         })
                     else:
-                        self.signals.status_changed.emit(f"__map_status__Extracting session {i+1}/{len(sessions)}...")
-                        graph = extract_concepts(s['transcript'], model=ollama_model, status_callback=_on_status, llm_provider=llm_provider, api_key=gemini_key)
+                        gemini_model = self.settings.get("gemini_model", "gemini-1.5-flash")
+                        graph = extract_concepts(
+                            s['transcript'], 
+                            model=ollama_model, 
+                            status_callback=_on_status, 
+                            llm_provider=llm_provider, 
+                            api_key=gemini_key,
+                            gemini_model=gemini_model
+                        )
                         db.save_concept_map(graph_json=json.dumps(graph), session_id=s['id'])
                         session_maps.append({
                             "session_id": s['id'],
@@ -1433,7 +1509,14 @@ class MainWindow(QMainWindow):
                 
                 # Merge
                 self.signals.status_changed.emit("__map_status__Merging all folder sessions...")
-                merged = merge_concept_maps(session_maps, model=ollama_model, status_callback=_on_status, llm_provider=llm_provider, api_key=gemini_key)
+                merged = merge_concept_maps(
+                    session_maps, 
+                    model=ollama_model, 
+                    status_callback=_on_status, 
+                    llm_provider=llm_provider, 
+                    api_key=gemini_key,
+                    gemini_model=gemini_model
+                )
                 db.save_concept_map(graph_json=json.dumps(merged), folder_id=folder_id)
                 self._pending_map_graph = merged
                 self.signals.status_changed.emit("__folder_map_ready__")
@@ -1495,7 +1578,8 @@ QUESTION:
                 if llm_provider == "gemini":
                     from main import ask_gemini_stream
                     gemini_key = model.gemini_api_key if model else ""
-                    for chunk in ask_gemini_stream(prompt, api_key=gemini_key):
+                    gemini_model = model.gemini_model if model else "gemini-1.5-flash"
+                    for chunk in ask_gemini_stream(prompt, api_key=gemini_key, model=gemini_model):
                         self.signals.status_changed.emit(f"__chat_chunk__{chunk}")
                 else:
                     from main import ask_ollama_stream
