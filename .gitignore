@@ -12,3 +12,5 @@ models/
 .vscode/
 env/
 settings.json
+speakers.json
+!settings.example.json

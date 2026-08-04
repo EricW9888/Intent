@@ -621,6 +621,24 @@ def load_local_model(config: AppConfig) -> WhisperModel:
     return model
 
 
+# Matches an env-var style prefix such as `GEMINI_API_KEY=` or `export DEEPGRAM_KEY=`.
+# The name must be upper-case and something other than `=` has to follow, so a real
+# key that merely ends in padding (`...==`) is never mistaken for a prefix.
+_KEY_PREFIX_RE = re.compile(r"^(?:export\s+)?[A-Z][A-Z0-9_]*\s*=\s*(?=[^\s=])")
+
+
+def sanitize_api_key(value: str) -> str:
+    """Normalize a pasted API key.
+
+    Keys are often copied out of a .env line or shell export, so strip a leading
+    ``NAME=`` prefix, surrounding quotes, and any whitespace. Sanitizing here and
+    on save keeps a malformed value from ever reaching a request URL.
+    """
+    key = (value or "").strip().strip('"').strip("'")
+    key = _KEY_PREFIX_RE.sub("", key)
+    return "".join(key.split())
+
+
 def ask_gemini(prompt: str, api_key: str, model: str = "gemini-1.5-flash", timeout: int = 30) -> str | None:
     """Query Google Gemini API via REST. Returns the response text, or None on any failure."""
     if not api_key:
@@ -628,7 +646,7 @@ def ask_gemini(prompt: str, api_key: str, model: str = "gemini-1.5-flash", timeo
         return None
         
     import urllib.parse
-    cleaned_key = urllib.parse.quote(api_key.replace("GEMINI_API_KEY=", "").strip().replace(" ", ""))
+    cleaned_key = urllib.parse.quote(sanitize_api_key(api_key))
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={cleaned_key}"
     payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
     
@@ -653,7 +671,7 @@ def ask_gemini_stream(prompt: str, api_key: str, model: str = "gemini-1.5-flash"
         return
         
     import urllib.parse
-    cleaned_key = urllib.parse.quote(api_key.replace("GEMINI_API_KEY=", "").strip().replace(" ", ""))
+    cleaned_key = urllib.parse.quote(sanitize_api_key(api_key))
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={cleaned_key}"
     payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
     

@@ -4,8 +4,8 @@ Intent is a local-first speech-to-text tool to keep meetings on track, with topi
 
 ## Features
 - Live mic transcription with adaptive voice activity detection and overlap handling to avoid boundary word loss.
-- Rolling context: keeps recent verbatim text
-- Topic tracking and off-topic detection using heuristics, backe up occasionally by a chosen AI provider (Gemini or local Ollama).
+- Rolling context: keeps recent text verbatim and compresses older material into a structured memory so long sessions stay within budget.
+- Topic tracking and off-topic detection using heuristics, backed up occasionally by a chosen AI provider (Gemini or local Ollama).
 - Optional Deepgram fallback for transcription and optional Deepgram TTS warnings.
 - PyQt GUI: session/folder tree, transcript view, concept map tab, settings for AI provider and Deepgram.
 - Outputs plain text transcripts and JSON metadata per session.
@@ -63,8 +63,19 @@ Use Settings to choose AI provider (Gemini or local Ollama) and toggle Deepgram.
 - **Topic detection**: optional; uses sentence-transformers embeddings plus your chosen AI provider (Gemini or Ollama) to infer/refresh topics and warn on drift.
 - **Concept maps**: transcripts can be turned into concept graphs in the GUI.
 
+## Configuration
+Copy `settings.example.json` to `settings.json` and fill in whichever keys you need — or leave the file alone and set everything through the GUI's Settings dialog, which writes it for you.
+
+```bash
+cp settings.example.json settings.json
+```
+
+`settings.json` holds API keys and is gitignored. **Never commit it.** Keys pasted with a `NAME=` prefix or stray whitespace are normalized on save.
+
+Both files resolve relative to the source directory, so the GUI can be launched from anywhere.
+
 ## Repo hygiene
-`.gitignore` excludes venvs, caches, transcripts, databases, and downloaded models. Source and config files are tracked; heavy artifacts are not.
+`.gitignore` excludes venvs, caches, transcripts, databases, downloaded models, local settings, and speaker profiles. Source is tracked; secrets, personal data, and heavy artifacts are not.
 
 ## Troubleshooting
 - Model download slow: try `--model tiny` first; ensure Hugging Face cache access.

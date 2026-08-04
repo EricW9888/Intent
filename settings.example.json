@@ -1,0 +1,10 @@
+{
+    "enable_ollama": true,
+    "llm_provider": "ollama",
+    "ollama_model": "llama3.2:1b",
+    "gemini_api_key": "",
+    "gemini_model": "gemini-1.5-flash",
+    "deepgram_enabled": false,
+    "deepgram_api_key": "",
+    "last_folder_id": null
+}

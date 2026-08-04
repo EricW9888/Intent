@@ -17,9 +17,18 @@ from PyQt6.QtGui import (
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QModelIndex, QMimeData
 
 import database as db
-from main import TranscriberEngine, AppConfig, default_output_paths, UtteranceRecord, ensure_ollama
+from main import (
+    TranscriberEngine, AppConfig, default_output_paths, UtteranceRecord, ensure_ollama,
+    sanitize_api_key,
+)
 from concept_map_widget import ConceptMapWidget
 from concept_extraction import extract_concepts, merge_concept_maps
+
+# Resolve app files against the source directory, not the working directory, so the
+# GUI finds the same settings and transcripts no matter where it is launched from.
+BASE_DIR = Path(__file__).resolve().parent
+SETTINGS_PATH = BASE_DIR / "settings.json"
+TRANSCRIPTS_DIR = BASE_DIR / "transcripts"
 
 SPEAKER_COLORS_DARK = [
     "#60a5fa", "#34d399", "#a78bfa", "#fbbf24",
@@ -350,13 +359,18 @@ class MainWindow(QMainWindow):
 
     def _load_settings(self) -> dict:
         try:
-            with open("settings.json", "r") as f:
-                return json.load(f)
+            with open(SETTINGS_PATH, "r") as f:
+                settings = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             return {"enable_ollama": True, "last_folder_id": None}
+        # Heal keys saved before they were sanitized on write.
+        for field in ("gemini_api_key", "deepgram_api_key"):
+            if settings.get(field):
+                settings[field] = sanitize_api_key(settings[field])
+        return settings
 
     def _save_settings(self):
-        with open("settings.json", "w") as f:
+        with open(SETTINGS_PATH, "w") as f:
             json.dump(self.settings, f, indent=4)
 
     def _preload_model(self):
@@ -931,7 +945,7 @@ class MainWindow(QMainWindow):
             try:
                 db.delete_session(session_id)
                 # Delete corresponding audio folder
-                folder_path = Path("transcripts") / session_id
+                folder_path = TRANSCRIPTS_DIR / session_id
                 if folder_path.exists():
                     import shutil
                     shutil.rmtree(folder_path, ignore_errors=True)
@@ -976,13 +990,13 @@ class MainWindow(QMainWindow):
                 self.settings["llm_provider"] = new_provider
                 changed = True
             # Gemini Key
-            new_gem_key = dialog.gemini_key_input.text().strip()
+            new_gem_key = sanitize_api_key(dialog.gemini_key_input.text())
             if new_gem_key != self.settings.get("gemini_api_key", ""):
                 self.settings["gemini_api_key"] = new_gem_key
                 changed = True
             # Deepgram
             new_dg = dialog.deepgram_checkbox.isChecked()
-            new_key = dialog.deepgram_key_input.text().strip()
+            new_key = sanitize_api_key(dialog.deepgram_key_input.text())
             if new_dg != self.settings.get("deepgram_enabled", False):
                 self.settings["deepgram_enabled"] = new_dg
                 changed = True
