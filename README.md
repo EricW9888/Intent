@@ -74,6 +74,15 @@ cp settings.example.json settings.json
 
 Both files resolve relative to the source directory, so the GUI can be launched from anywhere.
 
+## Secret scan
+`scripts/check_secrets.py` scans for API keys, private-key blocks, and — the failure mode that actually bit this repo — files that `.gitignore` lists but git still tracks. It reports paths, line numbers, and detector names only, never the matched value.
+
+```bash
+python3 scripts/check_secrets.py            # scan tracked files
+python3 scripts/check_secrets.py --staged   # scan what you are about to commit
+ln -sf ../../scripts/pre-commit .git/hooks/pre-commit   # block such commits automatically
+```
+
 ## Repo hygiene
 `.gitignore` excludes venvs, caches, transcripts, databases, downloaded models, local settings, and speaker profiles. Source is tracked; secrets, personal data, and heavy artifacts are not.
 
